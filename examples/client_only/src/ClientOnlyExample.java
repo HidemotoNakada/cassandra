@@ -20,6 +20,7 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.filter.QueryPath;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.StorageService;
