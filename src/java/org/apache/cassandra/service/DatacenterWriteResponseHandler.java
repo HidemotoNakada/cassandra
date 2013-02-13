@@ -23,11 +23,13 @@ import java.util.Collection;
 import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Table;
 import org.apache.cassandra.exceptions.UnavailableException;
 import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.WriteType;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -37,47 +39,24 @@ public class DatacenterWriteResponseHandler extends WriteResponseHandler
 {
     private static final IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
 
-    private static final String localdc;
-    static
+    public DatacenterWriteResponseHandler(Collection<InetAddress> naturalEndpoints,
+                                          Collection<InetAddress> pendingEndpoints,
+                                          ConsistencyLevel consistencyLevel,
+                                          Table table,
+                                          Runnable callback,
+                                          WriteType writeType)
     {
-        localdc = snitch.getDatacenter(FBUtilities.getBroadcastAddress());
-    }
-
-    protected DatacenterWriteResponseHandler(Collection<InetAddress> naturalEndpoints, Collection<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table, Runnable callback)
-    {
-        super(naturalEndpoints, pendingEndpoints, consistencyLevel, table, callback);
+        super(naturalEndpoints, pendingEndpoints, consistencyLevel, table, callback, writeType);
         assert consistencyLevel == ConsistencyLevel.LOCAL_QUORUM;
-    }
-
-    public static AbstractWriteResponseHandler create(Collection<InetAddress> writeEndpoints, Collection<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table, Runnable callback)
-    {
-        return new DatacenterWriteResponseHandler(writeEndpoints, pendingEndpoints, consistencyLevel, table, callback);
     }
 
     @Override
     public void response(MessageIn message)
     {
-        if (message == null || localdc.equals(snitch.getDatacenter(message.from)))
+        if (message == null || DatabaseDescriptor.getLocalDataCenter().equals(snitch.getDatacenter(message.from)))
         {
             if (responses.decrementAndGet() == 0)
                 signal();
         }
     }
-
-    @Override
-    public void assureSufficientLiveNodes() throws UnavailableException
-    {
-        int liveNodes = 0;
-        for (InetAddress destination : Iterables.concat(naturalEndpoints, pendingEndpoints))
-        {
-            if (localdc.equals(snitch.getDatacenter(destination)) && FailureDetector.instance.isAlive(destination))
-                liveNodes++;
-        }
-
-        if (liveNodes < responses.get())
-        {
-            throw new UnavailableException(consistencyLevel, responses.get(), liveNodes);
-        }
-    }
-
 }

@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.db;
 
+import java.io.DataInputStream;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
@@ -24,28 +25,33 @@ import java.nio.charset.CharacterCodingException;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
 
+import com.google.common.base.Function;
 import com.google.common.collect.HashMultimap;
-import com.google.common.collect.Multimap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.SetMultimap;
+import com.google.common.collect.Sets;
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.KSMetaData;
+import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
+import org.apache.cassandra.db.commitlog.ReplayPosition;
 import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.filter.QueryPath;
-import org.apache.cassandra.db.marshal.AsciiType;
-import org.apache.cassandra.db.marshal.BytesType;
-import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.sstable.SSTableReader;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.Constants;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.CounterId;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.thrift.cassandraConstants;
+import org.apache.cassandra.utils.*;
 
 import static org.apache.cassandra.cql3.QueryProcessor.processInternal;
 
@@ -55,6 +61,7 @@ public class SystemTable
 
     // see CFMetaData for schema definitions
     public static final String PEERS_CF = "peers";
+    public static final String PEER_EVENTS_CF = "peer_events";
     public static final String LOCAL_CF = "local";
     public static final String INDEX_CF = "IndexInfo";
     public static final String COUNTER_ID_CF = "NodeIdInfo";
@@ -65,6 +72,7 @@ public class SystemTable
     public static final String SCHEMA_KEYSPACES_CF = "schema_keyspaces";
     public static final String SCHEMA_COLUMNFAMILIES_CF = "schema_columnfamilies";
     public static final String SCHEMA_COLUMNS_CF = "schema_columns";
+    public static final String COMPACTION_LOG = "compactions_in_progress";
 
     @Deprecated
     public static final String OLD_STATUS_CF = "LocationInfo";
@@ -72,7 +80,6 @@ public class SystemTable
     public static final String OLD_HINTS_CF = "HintsColumnFamily";
 
     private static final String LOCAL_KEY = "local";
-    private static final ByteBuffer CURRENT_LOCAL_NODE_ID_KEY = ByteBufferUtil.bytes("CurrentLocal");
     private static final ByteBuffer ALL_LOCAL_NODE_ID_KEY = ByteBufferUtil.bytes("Local");
 
     public enum BootstrapState
@@ -103,16 +110,36 @@ public class SystemTable
         {
             throw new RuntimeException(e);
         }
+
+        // add entries to system schema columnfamilies for the hardcoded system definitions
+        for (String ksname : Schema.systemKeyspaceNames)
+        {
+            KSMetaData ksmd = Schema.instance.getKSMetaData(ksname);
+
+            // delete old, possibly obsolete entries in schema columnfamilies
+            for (String cfname : Arrays.asList(SystemTable.SCHEMA_KEYSPACES_CF, SystemTable.SCHEMA_COLUMNFAMILIES_CF, SystemTable.SCHEMA_COLUMNS_CF))
+            {
+                String req = String.format("DELETE FROM system.%s WHERE keyspace_name = '%s'", cfname, ksmd.name);
+                processInternal(req);
+            }
+
+            // (+1 to timestamp to make sure we don't get shadowed by the tombstones we just added)
+            ksmd.toSchema(FBUtilities.timestampMicros() + 1).apply();
+        }
     }
 
     private static void setupVersion()
     {
-        String req = "INSERT INTO system.%s (key, release_version, cql_version, thrift_version) VALUES ('%s', '%s', '%s', '%s')";
+        String req = "INSERT INTO system.%s (key, release_version, cql_version, thrift_version, data_center, rack, partitioner) VALUES ('%s', '%s', '%s', '%s', '%s', '%s', '%s')";
+        IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
         processInternal(String.format(req, LOCAL_CF,
                                          LOCAL_KEY,
                                          FBUtilities.getReleaseVersionString(),
                                          QueryProcessor.CQL_VERSION.toString(),
-                                         Constants.VERSION));
+                                         cassandraConstants.VERSION,
+                                         snitch.getDatacenter(FBUtilities.getBroadcastAddress()),
+                                         snitch.getRack(FBUtilities.getBroadcastAddress()),
+                                         DatabaseDescriptor.getPartitioner().getClass().getName()));
     }
 
     /** if system data becomes incompatible across versions of cassandra, that logic (and associated purging) is managed here */
@@ -125,9 +152,9 @@ public class SystemTable
             SortedSet<ByteBuffer> cols = new TreeSet<ByteBuffer>(BytesType.instance);
             cols.add(ByteBufferUtil.bytes("ClusterName"));
             cols.add(ByteBufferUtil.bytes("Token"));
-            QueryFilter filter = QueryFilter.getNamesFilter(decorate(ByteBufferUtil.bytes("L")), new QueryPath(OLD_STATUS_CF), cols);
+            QueryFilter filter = QueryFilter.getNamesFilter(decorate(ByteBufferUtil.bytes("L")), OLD_STATUS_CF, cols);
             ColumnFamily oldCf = oldStatusCfs.getColumnFamily(filter);
-            Iterator<IColumn> oldColumns = oldCf.columns.iterator();
+            Iterator<Column> oldColumns = oldCf.columns.iterator();
 
             String clusterName = null;
             try
@@ -140,9 +167,9 @@ public class SystemTable
             }
             // serialize the old token as a collection of (one )tokens.
             Token token = StorageService.getPartitioner().getTokenFactory().fromByteArray(oldColumns.next().value());
-            String tokenBytes = ByteBufferUtil.bytesToHex(serializeTokens(Collections.singleton(token)));
+            String tokenBytes = tokensAsSet(Collections.singleton(token));
             // (assume that any node getting upgraded was bootstrapped, since that was stored in a separate row for no particular reason)
-            String req = "INSERT INTO system.%s (key, cluster_name, token_bytes, bootstrapped) VALUES ('%s', '%s', '%s', '%s')";
+            String req = "INSERT INTO system.%s (key, cluster_name, tokens, bootstrapped) VALUES ('%s', '%s', %s, '%s')";
             processInternal(String.format(req, LOCAL_CF, LOCAL_KEY, clusterName, tokenBytes, BootstrapState.COMPLETED.name()));
 
             oldStatusCfs.truncate();
@@ -157,39 +184,198 @@ public class SystemTable
     }
 
     /**
+     * Write compaction log, except columfamilies under system keyspace.
+     *
+     * @param cfs
+     * @param toCompact sstables to compact
+     * @return compaction task id or null if cfs is under system keyspace
+     */
+    public static UUID startCompaction(ColumnFamilyStore cfs, Iterable<SSTableReader> toCompact)
+    {
+        if (Table.SYSTEM_KS.equals(cfs.table.getName()))
+            return null;
+
+        UUID compactionId = UUIDGen.getTimeUUID();
+        String req = "INSERT INTO system.%s (id, keyspace_name, columnfamily_name, inputs) VALUES (%s, '%s', '%s', {%s})";
+        Iterable<Integer> generations = Iterables.transform(toCompact, new Function<SSTableReader, Integer>()
+        {
+            public Integer apply(SSTableReader sstable)
+            {
+                return sstable.descriptor.generation;
+            }
+        });
+        processInternal(String.format(req, COMPACTION_LOG, compactionId, cfs.table.getName(), cfs.name, StringUtils.join(Sets.newHashSet(generations), ',')));
+        forceBlockingFlush(COMPACTION_LOG);
+        return compactionId;
+    }
+
+    public static void finishCompaction(UUID taskId)
+    {
+        assert taskId != null;
+
+        String req = "DELETE FROM system.%s WHERE id = %s";
+        processInternal(String.format(req, COMPACTION_LOG, taskId));
+        forceBlockingFlush(COMPACTION_LOG);
+    }
+
+    /**
+     * @return unfinished compactions, grouped by keyspace/columnfamily pair.
+     */
+    public static SetMultimap<Pair<String, String>, Integer> getUnfinishedCompactions()
+    {
+        String req = "SELECT * FROM system.%s";
+        UntypedResultSet resultSet = processInternal(String.format(req, COMPACTION_LOG));
+
+        SetMultimap<Pair<String, String>, Integer> unfinishedCompactions = HashMultimap.create();
+        for (UntypedResultSet.Row row : resultSet)
+        {
+            String keyspace = row.getString("keyspace_name");
+            String columnfamily = row.getString("columnfamily_name");
+            Set<Integer> inputs = row.getSet("inputs", Int32Type.instance);
+
+            unfinishedCompactions.putAll(Pair.create(keyspace, columnfamily), inputs);
+        }
+        return unfinishedCompactions;
+    }
+
+    public static void discardCompactionsInProgress()
+    {
+        ColumnFamilyStore compactionLog = Table.open(Table.SYSTEM_KS).getColumnFamilyStore(COMPACTION_LOG);
+        try
+        {
+            compactionLog.truncate().get();
+        }
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static void saveTruncationPosition(ColumnFamilyStore cfs, ReplayPosition position)
+    {
+        String req = "UPDATE system.%s SET truncated_at = truncated_at + %s WHERE key = '%s'";
+        processInternal(String.format(req, LOCAL_CF, positionAsMapEntry(cfs, position), LOCAL_KEY));
+        forceBlockingFlush(LOCAL_CF);
+    }
+
+    private static String positionAsMapEntry(ColumnFamilyStore cfs, ReplayPosition position)
+    {
+        DataOutputBuffer out = new DataOutputBuffer();
+        try
+        {
+            ReplayPosition.serializer.serialize(position, out);
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+        return String.format("{%s: 0x%s}",
+                             cfs.metadata.cfId,
+                             ByteBufferUtil.bytesToHex(ByteBuffer.wrap(out.getData(), 0, out.getLength())));
+    }
+
+    public static Map<UUID, ReplayPosition> getTruncationPositions()
+    {
+        String req = "SELECT truncated_at FROM system.%s WHERE key = '%s'";
+        UntypedResultSet rows = processInternal(String.format(req, LOCAL_CF, LOCAL_KEY));
+        if (rows.isEmpty())
+            return Collections.emptyMap();
+
+        UntypedResultSet.Row row = rows.one();
+        Map<UUID, ByteBuffer> rawMap = row.getMap("truncated_at", UUIDType.instance, BytesType.instance);
+        if (rawMap == null)
+            return Collections.emptyMap();
+
+        Map<UUID, ReplayPosition> positions = new HashMap<UUID, ReplayPosition>();
+        for (Map.Entry<UUID, ByteBuffer> entry : rawMap.entrySet())
+        {
+            positions.put(entry.getKey(), positionFromBlob(entry.getValue()));
+        }
+        return positions;
+    }
+
+    private static ReplayPosition positionFromBlob(ByteBuffer bytes)
+    {
+        try
+        {
+            return ReplayPosition.serializer.deserialize(new DataInputStream(ByteBufferUtil.inputStream(bytes)));
+        }
+        catch (IOException e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
      * Record tokens being used by another node
      */
     public static synchronized void updateTokens(InetAddress ep, Collection<Token> tokens)
     {
         if (ep.equals(FBUtilities.getBroadcastAddress()))
         {
-            removeTokens(tokens);
+            removeEndpoint(ep);
             return;
         }
 
-        IPartitioner p = StorageService.getPartitioner();
-        for (Token token : tokens)
-        {
-            String req = "INSERT INTO system.%s (token_bytes, peer) VALUES ('%s', '%s')";
-            String tokenBytes = ByteBufferUtil.bytesToHex(p.getTokenFactory().toByteArray(token));
-            processInternal(String.format(req, PEERS_CF, tokenBytes, ep.getHostAddress()));
-        }
+        String req = "INSERT INTO system.%s (peer, tokens) VALUES ('%s', %s)";
+        processInternal(String.format(req, PEERS_CF, ep.getHostAddress(), tokensAsSet(tokens)));
         forceBlockingFlush(PEERS_CF);
+    }
+
+    public static synchronized void updatePeerInfo(InetAddress ep, String columnName, String value)
+    {
+        if (ep.equals(FBUtilities.getBroadcastAddress()))
+            return;
+
+        String req = "INSERT INTO system.%s (peer, %s) VALUES ('%s', %s)";
+        processInternal(String.format(req, PEERS_CF, columnName, ep.getHostAddress(), value));
+    }
+
+    public static synchronized void updateHintsDropped(InetAddress ep, UUID timePeriod, int value)
+    {
+        // with 30 day TTL
+        String req = "UPDATE system.%s USING TTL 2592000 SET hints_dropped[ %s ] = %s WHERE peer = '%s'";
+        processInternal(String.format(req, PEER_EVENTS_CF, timePeriod.toString(), value, ep.getHostAddress()));
+    }
+
+    public static synchronized void updateSchemaVersion(UUID version)
+    {
+        String req = "INSERT INTO system.%s (key, schema_version) VALUES ('%s', %s)";
+        processInternal(String.format(req, LOCAL_CF, LOCAL_KEY, version.toString()));
+    }
+
+    private static String tokensAsSet(Collection<Token> tokens)
+    {
+        Token.TokenFactory factory = StorageService.getPartitioner().getTokenFactory();
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        Iterator<Token> iter = tokens.iterator();
+        while (iter.hasNext())
+        {
+            sb.append("'").append(factory.toString(iter.next())).append("'");
+            if (iter.hasNext())
+                sb.append(",");
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private static Collection<Token> deserializeTokens(Collection<String> tokensStrings)
+    {
+        Token.TokenFactory factory = StorageService.getPartitioner().getTokenFactory();
+        List<Token> tokens = new ArrayList<Token>(tokensStrings.size());
+        for (String tk : tokensStrings)
+            tokens.add(factory.fromString(tk));
+        return tokens;
     }
 
     /**
      * Remove stored tokens being used by another node
      */
-    public static synchronized void removeTokens(Collection<Token> tokens)
+    public static synchronized void removeEndpoint(InetAddress ep)
     {
-        IPartitioner p = StorageService.getPartitioner();
-
-        for (Token token : tokens)
-        {
-            String req = "DELETE FROM system.%s WHERE token_bytes = '%s'";
-            String tokenBytes = ByteBufferUtil.bytesToHex(p.getTokenFactory().toByteArray(token));
-            processInternal(String.format(req, PEERS_CF, tokenBytes));
-        }
+        String req = "DELETE FROM system.%s WHERE peer = '%s'";
+        processInternal(String.format(req, PEERS_CF, ep.getHostAddress()));
         forceBlockingFlush(PEERS_CF);
     }
 
@@ -198,9 +384,9 @@ public class SystemTable
     */
     public static synchronized void updateTokens(Collection<Token> tokens)
     {
-        String req = "INSERT INTO system.%s (key, token_bytes) VALUES ('%s', '%s')";
-        String tokenBytes = ByteBufferUtil.bytesToHex(serializeTokens(tokens));
-        processInternal(String.format(req, LOCAL_CF, LOCAL_KEY, tokenBytes));
+        assert !tokens.isEmpty() : "removeEndpoint should be used instead";
+        String req = "INSERT INTO system.%s (key, tokens) VALUES ('%s', %s)";
+        processInternal(String.format(req, LOCAL_CF, LOCAL_KEY, tokensAsSet(tokens)));
         forceBlockingFlush(LOCAL_CF);
     }
 
@@ -217,53 +403,6 @@ public class SystemTable
         tokens.removeAll(rmTokens);
         tokens.addAll(addTokens);
         updateTokens(tokens);
-        return tokens;
-    }
-
-    /** Serialize a collection of tokens to bytes */
-    private static ByteBuffer serializeTokens(Collection<Token> tokens)
-    {
-        // Guesstimate the total number of bytes needed
-        int estCapacity = (tokens.size() * 16) + (tokens.size() * 2);
-        ByteBuffer toks = ByteBuffer.allocate(estCapacity);
-        IPartitioner p = StorageService.getPartitioner();
-
-        for (Token token : tokens)
-        {
-            ByteBuffer tokenBytes = p.getTokenFactory().toByteArray(token);
-
-            // If we blow the buffer, grow it by double
-            if (toks.remaining() < (2 + tokenBytes.remaining()))
-            {
-                estCapacity = estCapacity * 2;
-                ByteBuffer newToks = ByteBuffer.allocate(estCapacity);
-                toks.flip();
-                newToks.put(toks);
-                toks = newToks;
-            }
-
-            toks.putShort((short)tokenBytes.remaining());
-            toks.put(tokenBytes);
-        }
-
-        toks.flip();
-        return toks;
-    }
-
-    private static Collection<Token> deserializeTokens(ByteBuffer tokenBytes)
-    {
-        List<Token> tokens = new ArrayList<Token>();
-        IPartitioner p = StorageService.getPartitioner();
-
-        while(tokenBytes.hasRemaining())
-        {
-            short len = tokenBytes.getShort();
-            ByteBuffer dup = tokenBytes.slice();
-            dup.limit(len);
-            tokenBytes.position(tokenBytes.position() + len);
-            tokens.add(p.getTokenFactory().fromByteArray(dup));
-        }
-
         return tokens;
     }
 
@@ -287,15 +426,55 @@ public class SystemTable
      * Return a map of stored tokens to IP addresses
      *
      */
-    public static Multimap<InetAddress, Token> loadTokens()
+    public static SetMultimap<InetAddress, Token> loadTokens()
     {
-        IPartitioner p = StorageService.getPartitioner();
-
-        Multimap<InetAddress, Token> tokenMap = HashMultimap.create();
-        for (UntypedResultSet.Row row : processInternal("SELECT * FROM system." + PEERS_CF))
-            tokenMap.put(row.getInetAddress("peer"), p.getTokenFactory().fromByteArray(row.getBytes("token_bytes")));
+        SetMultimap<InetAddress, Token> tokenMap = HashMultimap.create();
+        for (UntypedResultSet.Row row : processInternal("SELECT peer, tokens FROM system." + PEERS_CF))
+        {
+            InetAddress peer = row.getInetAddress("peer");
+            if (row.has("tokens"))
+                tokenMap.putAll(peer, deserializeTokens(row.getSet("tokens", UTF8Type.instance)));
+        }
 
         return tokenMap;
+    }
+
+    /**
+     * Return a map of store host_ids to IP addresses
+     *
+     */
+    public static Map<InetAddress, UUID> loadHostIds()
+    {
+        Map<InetAddress, UUID> hostIdMap = new HashMap<InetAddress, UUID>();
+        for (UntypedResultSet.Row row : processInternal("SELECT peer, host_id FROM system." + PEERS_CF))
+        {
+            InetAddress peer = row.getInetAddress("peer");
+            if (row.has("host_id"))
+            {
+                hostIdMap.put(peer, row.getUUID("host_id"));
+            }
+        }
+        return hostIdMap;
+    }
+
+    /**
+     * Return a map of IP addresses containing a map of dc and rack info
+     */
+    public static Map<InetAddress, Map<String,String>> loadDcRackInfo()
+    {
+        Map<InetAddress, Map<String, String>> result = new HashMap<InetAddress, Map<String, String>>();
+        for (UntypedResultSet.Row row : processInternal("SELECT peer, data_center, rack from system." + PEERS_CF))
+        {
+            InetAddress peer = row.getInetAddress("peer");
+            if (row.has("data_center") && row.has("rack"))
+            {
+                Map<String, String> dcRack = new HashMap<String, String>();
+                dcRack.put("data_center", row.getString("data_center"));
+                dcRack.put("rack", row.getString("rack"));
+                result.put(peer, dcRack);
+            }
+        }
+        return result;
     }
 
     /**
@@ -343,11 +522,11 @@ public class SystemTable
 
     public static Collection<Token> getSavedTokens()
     {
-        String req = "SELECT token_bytes FROM system.%s WHERE key='%s'";
+        String req = "SELECT tokens FROM system.%s WHERE key='%s'";
         UntypedResultSet result = processInternal(String.format(req, LOCAL_CF, LOCAL_KEY));
-        return result.isEmpty() || !result.one().has("token_bytes")
+        return result.isEmpty() || !result.one().has("tokens")
              ? Collections.<Token>emptyList()
-             : deserializeTokens(result.one().getBytes("token_bytes"));
+             : deserializeTokens(result.one().<String>getSet("tokens", UTF8Type.instance));
     }
 
     public static int incrementAndGetGeneration()
@@ -419,7 +598,7 @@ public class SystemTable
     {
         ColumnFamilyStore cfs = Table.open(Table.SYSTEM_KS).getColumnFamilyStore(INDEX_CF);
         QueryFilter filter = QueryFilter.getNamesFilter(decorate(ByteBufferUtil.bytes(table)),
-                                                        new QueryPath(INDEX_CF),
+                                                        INDEX_CF,
                                                         ByteBufferUtil.bytes(indexName));
         return ColumnFamilyStore.removeDeleted(cfs.getColumnFamily(filter), Integer.MAX_VALUE) != null;
     }
@@ -437,7 +616,7 @@ public class SystemTable
     public static void setIndexRemoved(String table, String indexName)
     {
         RowMutation rm = new RowMutation(Table.SYSTEM_KS, ByteBufferUtil.bytes(table));
-        rm.delete(new QueryPath(INDEX_CF, null, ByteBufferUtil.bytes(indexName)), FBUtilities.timestampMicros());
+        rm.delete(INDEX_CF, ByteBufferUtil.bytes(indexName), FBUtilities.timestampMicros());
         rm.apply();
         forceBlockingFlush(INDEX_CF);
     }
@@ -450,20 +629,20 @@ public class SystemTable
     {
         UUID hostId = null;
 
-        String req = "SELECT ring_id FROM system.%s WHERE key='%s'";
+        String req = "SELECT host_id FROM system.%s WHERE key='%s'";
         UntypedResultSet result = processInternal(String.format(req, LOCAL_CF, LOCAL_KEY));
 
         // Look up the Host UUID (return it if found)
-        if (!result.isEmpty() && result.one().has("ring_id"))
+        if (!result.isEmpty() && result.one().has("host_id"))
         {
-            return result.one().getUUID("ring_id");
+            return result.one().getUUID("host_id");
         }
 
         // ID not found, generate a new one, persist, and then return it.
         hostId = UUID.randomUUID();
         logger.warn("No host ID found, created {} (Note: This should happen exactly once per node).", hostId);
 
-        req = "INSERT INTO system.%s (key, ring_id) VALUES ('%s', '%s')";
+        req = "INSERT INTO system.%s (key, host_id) VALUES ('%s', %s)";
         processInternal(String.format(req, LOCAL_CF, LOCAL_KEY, hostId));
         return hostId;
     }
@@ -474,12 +653,11 @@ public class SystemTable
      */
     public static CounterId getCurrentLocalCounterId()
     {
-        ByteBuffer id = null;
         Table table = Table.open(Table.SYSTEM_KS);
 
         // Get the last CounterId (since CounterId are timeuuid is thus ordered from the older to the newer one)
         QueryFilter filter = QueryFilter.getSliceFilter(decorate(ALL_LOCAL_NODE_ID_KEY),
-                                                        new QueryPath(COUNTER_ID_CF),
+                                                        COUNTER_ID_CF,
                                                         ByteBufferUtil.EMPTY_BYTE_BUFFER,
                                                         ByteBufferUtil.EMPTY_BYTE_BUFFER,
                                                         true,
@@ -517,11 +695,11 @@ public class SystemTable
         List<CounterId.CounterIdRecord> l = new ArrayList<CounterId.CounterIdRecord>();
 
         Table table = Table.open(Table.SYSTEM_KS);
-        QueryFilter filter = QueryFilter.getIdentityFilter(decorate(ALL_LOCAL_NODE_ID_KEY), new QueryPath(COUNTER_ID_CF));
+        QueryFilter filter = QueryFilter.getIdentityFilter(decorate(ALL_LOCAL_NODE_ID_KEY), COUNTER_ID_CF);
         ColumnFamily cf = table.getColumnFamilyStore(COUNTER_ID_CF).getColumnFamily(filter);
 
         CounterId previous = null;
-        for (IColumn c : cf)
+        for (Column c : cf)
         {
             if (previous != null)
                 l.add(new CounterId.CounterIdRecord(previous, c.timestamp()));
@@ -561,8 +739,7 @@ public class SystemTable
     {
         Token minToken = StorageService.getPartitioner().getMinimumToken();
 
-        return schemaCFS(schemaCfName).getRangeSlice(null,
-                                                     new Range<RowPosition>(minToken.minKeyBound(),
+        return schemaCFS(schemaCfName).getRangeSlice(new Range<RowPosition>(minToken.minKeyBound(),
                                                                             minToken.maxKeyBound()),
                                                      Integer.MAX_VALUE,
                                                      new IdentityQueryFilter(),
@@ -584,6 +761,9 @@ public class SystemTable
     {
         for (Row schemaRow : serializedSchema(schemaCfName))
         {
+            if (Schema.ignoredSchemaRow(schemaRow))
+                continue;
+
             RowMutation mutation = mutationMap.get(schemaRow.key);
 
             if (mutation == null)
@@ -616,7 +796,7 @@ public class SystemTable
         DecoratedKey key = StorageService.getPartitioner().decorateKey(getSchemaKSKey(ksName));
 
         ColumnFamilyStore schemaCFS = SystemTable.schemaCFS(SCHEMA_KEYSPACES_CF);
-        ColumnFamily result = schemaCFS.getColumnFamily(QueryFilter.getIdentityFilter(key, new QueryPath(SCHEMA_KEYSPACES_CF)));
+        ColumnFamily result = schemaCFS.getColumnFamily(QueryFilter.getIdentityFilter(key, SCHEMA_KEYSPACES_CF));
 
         return new Row(key, result);
     }
@@ -627,7 +807,6 @@ public class SystemTable
 
         ColumnFamilyStore schemaCFS = SystemTable.schemaCFS(SCHEMA_COLUMNFAMILIES_CF);
         ColumnFamily result = schemaCFS.getColumnFamily(key,
-                                                        new QueryPath(SCHEMA_COLUMNFAMILIES_CF),
                                                         DefsTable.searchComposite(cfName, true),
                                                         DefsTable.searchComposite(cfName, false),
                                                         false,

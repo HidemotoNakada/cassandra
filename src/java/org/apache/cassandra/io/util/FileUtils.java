@@ -23,11 +23,14 @@ import java.lang.reflect.Method;
 import java.nio.MappedByteBuffer;
 import java.text.DecimalFormat;
 import java.util.Arrays;
-import java.util.Comparator;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.BlacklistedDirectories;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.service.StorageService;
@@ -245,14 +248,6 @@ public class FileUtils
         }
     }
 
-    public static class FileComparator implements Comparator<File>
-    {
-        public int compare(File f, File f2)
-        {
-            return (int)(f.lastModified() - f2.lastModified());
-        }
-    }
-
     public static void createDirectory(String directory)
     {
         createDirectory(new File(directory));
@@ -367,6 +362,47 @@ public class FileUtils
             if (skipped == 0)
                 throw new EOFException("EOF after " + n + " bytes out of " + bytes);
             n += skipped;
+        }
+    }
+    
+    public static void handleFSError(FSError e)
+    {
+        switch (DatabaseDescriptor.getDiskFailurePolicy())
+        {
+            case stop:
+                if (StorageService.instance.isInitialized())
+                {
+                    logger.error("Stopping gossiper");
+                    StorageService.instance.stopGossiping();
+                }
+
+                if (StorageService.instance.isRPCServerRunning())
+                {
+                    logger.error("Stopping RPC server");
+                    StorageService.instance.stopRPCServer();
+                }
+
+                if (StorageService.instance.isNativeTransportRunning())
+                {
+                    logger.error("Stopping native transport");
+                    StorageService.instance.stopNativeTransport();
+                }
+                break;
+            case best_effort:
+                // for both read and write errors mark the path as unwritable.
+                BlacklistedDirectories.maybeMarkUnwritable(e.path);
+                if (e instanceof FSReadError)
+                {
+                    File directory = BlacklistedDirectories.maybeMarkUnreadable(e.path);
+                    if (directory != null)
+                        Table.removeUnreadableSSTables(directory);
+                }
+                break;
+            case ignore:
+                // already logged, so left nothing to do
+                break;
+            default:
+                throw new IllegalStateException();
         }
     }
 }

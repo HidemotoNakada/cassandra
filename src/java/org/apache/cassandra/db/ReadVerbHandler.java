@@ -27,6 +27,7 @@ import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class ReadVerbHandler implements IVerbHandler<ReadCommand>
@@ -49,9 +50,7 @@ public class ReadVerbHandler implements IVerbHandler<ReadCommand>
             MessageOut<ReadResponse> reply = new MessageOut<ReadResponse>(MessagingService.Verb.REQUEST_RESPONSE,
                                                                           getResponse(command, row),
                                                                           ReadResponse.serializer);
-            if (logger.isDebugEnabled())
-                logger.debug(String.format("Read key %s; sending response to %s@%s",
-                                            ByteBufferUtil.bytesToHex(command.key), id, message.from));
+            Tracing.trace("Enqueuing response to {}", message.from);
             MessagingService.instance().sendReply(reply, id, message.from);
         }
         catch (IOException ex)
@@ -64,8 +63,8 @@ public class ReadVerbHandler implements IVerbHandler<ReadCommand>
     {
         if (command.isDigestQuery())
         {
-            if (logger.isDebugEnabled())
-                logger.debug("digest is " + ByteBufferUtil.bytesToHex(ColumnFamily.digest(row.cf)));
+            if (logger.isTraceEnabled())
+                logger.trace("digest is " + ByteBufferUtil.bytesToHex(ColumnFamily.digest(row.cf)));
             return new ReadResponse(ColumnFamily.digest(row.cf));
         }
         else

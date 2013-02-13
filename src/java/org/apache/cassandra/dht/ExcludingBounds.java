@@ -77,6 +77,16 @@ public class ExcludingBounds<T extends RingPosition> extends AbstractBounds<T>
         return "(" + left + "," + right + ")";
     }
 
+    protected String getOpeningString()
+    {
+        return "(";
+    }
+
+    protected String getClosingString()
+    {
+        return ")";
+    }
+
     /**
      * Compute a bounds of keys corresponding to a given bounds of token.
      */
@@ -93,5 +103,10 @@ public class ExcludingBounds<T extends RingPosition> extends AbstractBounds<T>
     public AbstractBounds<Token> toTokenBounds()
     {
         return (left instanceof RowPosition) ? new ExcludingBounds<Token>(((RowPosition)left).getToken(), ((RowPosition)right).getToken(), partitioner) : (ExcludingBounds<Token>)this;
+    }
+
+    public AbstractBounds<T> withNewRight(T newRight)
+    {
+        return new ExcludingBounds<T>(left, newRight);
     }
 }

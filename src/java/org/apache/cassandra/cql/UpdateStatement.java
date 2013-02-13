@@ -27,15 +27,13 @@ import org.apache.cassandra.db.CounterMutation;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.IMutation;
 import org.apache.cassandra.db.RowMutation;
-import org.apache.cassandra.db.filter.QueryPath;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.UnauthorizedException;
-import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.thrift.ThriftClientState;
 
 import static org.apache.cassandra.cql.QueryProcessor.validateColumn;
 import static org.apache.cassandra.cql.QueryProcessor.validateKey;
-
 import static org.apache.cassandra.thrift.ThriftValidation.validateColumnFamily;
 
 /**
@@ -122,18 +120,16 @@ public class UpdateStatement extends AbstractModification
     }
 
     /** {@inheritDoc} */
-    public List<IMutation> prepareRowMutations(String keyspace, ClientState clientState, List<ByteBuffer> variables)
+    public List<IMutation> prepareRowMutations(String keyspace, ThriftClientState clientState, List<ByteBuffer> variables)
     throws InvalidRequestException, UnauthorizedException
     {
         return prepareRowMutations(keyspace, clientState, null, variables);
     }
 
     /** {@inheritDoc} */
-    public List<IMutation> prepareRowMutations(String keyspace, ClientState clientState, Long timestamp, List<ByteBuffer> variables)
+    public List<IMutation> prepareRowMutations(String keyspace, ThriftClientState clientState, Long timestamp, List<ByteBuffer> variables)
     throws InvalidRequestException, UnauthorizedException
     {
-        List<String> cfamsSeen = new ArrayList<String>();
-
         boolean hasCommutativeOperation = false;
 
         for (Map.Entry<Term, Operation> column : getColumns().entrySet())
@@ -151,12 +147,7 @@ public class UpdateStatement extends AbstractModification
 
         QueryProcessor.validateKeyAlias(metadata, keyName);
 
-        // Avoid unnecessary authorizations.
-        if (!(cfamsSeen.contains(columnFamily)))
-        {
-            clientState.hasColumnFamilyAccess(columnFamily, Permission.UPDATE);
-            cfamsSeen.add(columnFamily);
-        }
+        clientState.hasColumnFamilyAccess(keyspace, columnFamily, Permission.MODIFY);
 
         List<IMutation> rowMutations = new LinkedList<IMutation>();
 
@@ -182,7 +173,7 @@ public class UpdateStatement extends AbstractModification
      *
      * @throws InvalidRequestException on the wrong request
      */
-    private IMutation mutationForKey(String keyspace, ByteBuffer key, CFMetaData metadata, Long timestamp, ClientState clientState, List<ByteBuffer> variables)
+    private IMutation mutationForKey(String keyspace, ByteBuffer key, CFMetaData metadata, Long timestamp, ThriftClientState clientState, List<ByteBuffer> variables)
     throws InvalidRequestException
     {
         validateKey(key);
@@ -205,7 +196,8 @@ public class UpdateStatement extends AbstractModification
                 ByteBuffer colValue = op.a.getByteBuffer(getValueValidator(keyspace, colName),variables);
 
                 validateColumn(metadata, colName, colValue);
-                rm.add(new QueryPath(columnFamily, null, colName),
+                rm.add(columnFamily,
+                       colName,
                        colValue,
                        (timestamp == null) ? getTimestamp(clientState) : timestamp,
                        getTimeToLive());
@@ -229,7 +221,7 @@ public class UpdateStatement extends AbstractModification
                                                       op.b.getText()));
                 }
 
-                rm.addCounter(new QueryPath(columnFamily, null, colName), value);
+                rm.addCounter(columnFamily, colName, value);
             }
         }
 

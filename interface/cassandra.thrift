@@ -55,7 +55,7 @@ namespace rb CassandraThrift
 # An effort should be made not to break forward-client-compatibility either
 # (e.g. one should avoid removing obsolete fields from the IDL), but no
 # guarantees in this respect are made by the Cassandra project.
-const string VERSION = "19.34.0"
+const string VERSION = "19.36.0"
 
 
 #
@@ -311,7 +311,7 @@ struct IndexExpression {
 }
 
 /**
- * @Deprecated: use a KeyRange with row_filter in get_range_slices instead
+ * @deprecated use a KeyRange with row_filter in get_range_slices instead
  */
 struct IndexClause {
     1: required list<IndexExpression> expressions,
@@ -442,6 +442,11 @@ struct CfDef {
     33: optional double bloom_filter_fp_chance,
     34: optional string caching="keys_only",
     37: optional double dclocal_read_repair_chance = 0.0,
+    38: optional bool populate_io_cache_on_flush,
+    39: optional i32 memtable_flush_period_in_ms,
+    40: optional i32 default_time_to_live,
+    41: optional i32 index_interval,
+    42: optional string speculative_retry="NONE",
 
     /* All of the following are now ignored and unsupplied. */
 
@@ -473,7 +478,7 @@ struct KsDef {
     2: required string strategy_class,
     3: optional map<string,string> strategy_options,
 
-    /** @deprecated, ignored */
+    /** @deprecated ignored */
     4: optional i32 replication_factor,
 
     5: required list<CfDef> cf_defs,
@@ -519,6 +524,12 @@ struct CqlPreparedResult {
     4: optional list<string> variable_names
 }
 
+/** Represents input splits used by hadoop ColumnFamilyRecordReaders */
+struct CfSplit {
+    1: required string start_token,
+    2: required string end_token,
+    3: required i64 row_count
+}
 
 service Cassandra {
   # auth methods
@@ -596,7 +607,7 @@ service Cassandra {
 
   /**
     Returns the subset of columns specified in SlicePredicate for the rows matching the IndexClause
-    @Deprecated; use get_range_slices instead with range.row_filter specified
+    @deprecated use get_range_slices instead with range.row_filter specified
     */
   list<KeySlice> get_indexed_slices(1:required ColumnParent column_parent,
                                     2:required IndexClause index_clause,
@@ -739,6 +750,12 @@ service Cassandra {
       The next query will be traced idependently of trace probability and the returned UUID can be used to query the trace keyspace */
   binary trace_next_query(),
 
+  list<CfSplit> describe_splits_ex(1:required string cfName,
+                                   2:required string start_token,
+                                   3:required string end_token,
+                                   4:required i32 keys_per_split)
+    throws (1:InvalidRequestException ire), 
+
   /** adds a column family. returns the new schema id. */
   string system_add_column_family(1:required CfDef cf_def)
     throws (1:InvalidRequestException ire, 2:SchemaDisagreementException sde),
@@ -772,8 +789,14 @@ service Cassandra {
             2:UnavailableException ue,
             3:TimedOutException te,
             4:SchemaDisagreementException sde)
-            
-            
+
+  CqlResult execute_cql3_query(1:required binary query, 2:required Compression compression, 3:required ConsistencyLevel consistency)
+    throws (1:InvalidRequestException ire,
+            2:UnavailableException ue,
+            3:TimedOutException te,
+            4:SchemaDisagreementException sde)
+
+
   /**
    * Prepare a CQL (Cassandra Query Language) statement by compiling and returning
    * - the type of CQL statement
@@ -781,6 +804,9 @@ service Cassandra {
    * - a count of the discovered bound markers in the statement 
    */
   CqlPreparedResult prepare_cql_query(1:required binary query, 2:required Compression compression)
+    throws (1:InvalidRequestException ire)
+
+  CqlPreparedResult prepare_cql3_query(1:required binary query, 2:required Compression compression)
     throws (1:InvalidRequestException ire)
 
              
@@ -794,5 +820,14 @@ service Cassandra {
             3:TimedOutException te,
             4:SchemaDisagreementException sde)
 
+  CqlResult execute_prepared_cql3_query(1:required i32 itemId, 2:required list<binary> values, 3:required ConsistencyLevel consistency)
+    throws (1:InvalidRequestException ire,
+            2:UnavailableException ue,
+            3:TimedOutException te,
+            4:SchemaDisagreementException sde)
+
+  /**
+   * @deprecated This is now a no-op. Please use the CQL3 specific methods instead.
+   */
   void set_cql_version(1: required string version) throws (1:InvalidRequestException ire)
 }

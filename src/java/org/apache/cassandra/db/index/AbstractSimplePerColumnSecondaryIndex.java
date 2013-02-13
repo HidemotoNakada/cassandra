@@ -25,6 +25,7 @@ import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.dht.*;
+import org.apache.cassandra.thrift.IndexExpression;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -62,7 +63,7 @@ public abstract class AbstractSimplePerColumnSecondaryIndex extends PerColumnSec
             double averageColumnCount = indexCfs.getMeanColumns();
             if (averageColumnCount > 0 && estimatedKeys / averageColumnCount > 1)
             {
-                logger.debug("turning row cache on for " + indexCfs.getColumnFamilyName());
+                logger.debug("turning row cache on for " + indexCfs.name);
                 indexCfs.metadata.caching(baseCaching);
                 indexCfs.initRowCache();
             }
@@ -71,9 +72,21 @@ public abstract class AbstractSimplePerColumnSecondaryIndex extends PerColumnSec
 
     protected abstract void init(ColumnDefinition columnDef);
 
-    protected abstract ByteBuffer makeIndexColumnName(ByteBuffer rowKey, IColumn column);
+    protected abstract ByteBuffer makeIndexColumnName(ByteBuffer rowKey, Column column);
 
-    public void delete(ByteBuffer rowKey, IColumn column)
+    protected abstract AbstractType getExpressionComparator();
+
+    public String expressionString(IndexExpression expr)
+    {
+        return String.format("'%s.%s %s %s'",
+                             baseCfs.name,
+                             getExpressionComparator().getString(expr.column_name),
+                             expr.op,
+                             baseCfs.metadata.getColumn_metadata().get(expr.column_name).getValidator().getString(expr.value));
+    }
+
+
+    public void delete(ByteBuffer rowKey, Column column)
     {
         if (column.isMarkedForDelete())
             return;
@@ -87,7 +100,7 @@ public abstract class AbstractSimplePerColumnSecondaryIndex extends PerColumnSec
             logger.debug("removed index entry for cleaned-up value {}:{}", valueKey, cfi);
     }
 
-    public void insert(ByteBuffer rowKey, IColumn column)
+    public void insert(ByteBuffer rowKey, Column column)
     {
         DecoratedKey valueKey = getIndexKeyFor(column.value());
         ColumnFamily cfi = ColumnFamily.create(indexCfs.metadata);
@@ -107,7 +120,7 @@ public abstract class AbstractSimplePerColumnSecondaryIndex extends PerColumnSec
         indexCfs.apply(valueKey, cfi, SecondaryIndexManager.nullUpdater);
     }
 
-    public void update(ByteBuffer rowKey, IColumn col)
+    public void update(ByteBuffer rowKey, Column col)
     {
         insert(rowKey, col);
     }
@@ -150,7 +163,7 @@ public abstract class AbstractSimplePerColumnSecondaryIndex extends PerColumnSec
 
     public String getIndexName()
     {
-        return indexCfs.columnFamily;
+        return indexCfs.name;
     }
 
     public long getLiveSize()

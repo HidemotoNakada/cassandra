@@ -45,11 +45,13 @@ import org.apache.cassandra.utils.EstimatedHistogram;
  */
 public class SSTableMetadata
 {
+    public static final double NO_COMPRESSION_RATIO = -1.0;
     public static final SSTableMetadataSerializer serializer = new SSTableMetadataSerializer();
 
     public final EstimatedHistogram estimatedRowSize;
     public final EstimatedHistogram estimatedColumnCount;
     public final ReplayPosition replayPosition;
+    public final long minTimestamp;
     public final long maxTimestamp;
     public final double compressionRatio;
     public final String partitioner;
@@ -61,19 +63,21 @@ public class SSTableMetadata
         this(defaultRowSizeHistogram(),
              defaultColumnCountHistogram(),
              ReplayPosition.NONE,
+             Long.MAX_VALUE,
              Long.MIN_VALUE,
-             Double.MIN_VALUE,
+             NO_COMPRESSION_RATIO,
              null,
              Collections.<Integer>emptySet(),
              defaultTombstoneDropTimeHistogram());
     }
 
-    private SSTableMetadata(EstimatedHistogram rowSizes, EstimatedHistogram columnCounts, ReplayPosition replayPosition, long maxTimestamp,
-                            double cr, String partitioner, Set<Integer> ancestors, StreamingHistogram estimatedTombstoneDropTime)
+    private SSTableMetadata(EstimatedHistogram rowSizes, EstimatedHistogram columnCounts, ReplayPosition replayPosition, long minTimestamp,
+            long maxTimestamp, double cr, String partitioner, Set<Integer> ancestors, StreamingHistogram estimatedTombstoneDropTime)
     {
         this.estimatedRowSize = rowSizes;
         this.estimatedColumnCount = columnCounts;
         this.replayPosition = replayPosition;
+        this.minTimestamp = minTimestamp;
         this.maxTimestamp = maxTimestamp;
         this.compressionRatio = cr;
         this.partitioner = partitioner;
@@ -117,10 +121,20 @@ public class SSTableMetadata
         long estimatedColumnCount = this.estimatedColumnCount.mean() * this.estimatedColumnCount.count();
         if (estimatedColumnCount > 0)
         {
-            double droppable = estimatedTombstoneDropTime.sum(gcBefore);
+            double droppable = getDroppableTombstonesBefore(gcBefore);
             return droppable / estimatedColumnCount;
         }
         return 0.0f;
+    }
+
+    /**
+     * Get the amount of droppable tombstones
+     * @param gcBefore the gc time
+     * @return amount of droppable tombstones
+     */
+    public double getDroppableTombstonesBefore(int gcBefore)
+    {
+        return estimatedTombstoneDropTime.sum(gcBefore);
     }
 
     public static class Collector
@@ -128,8 +142,9 @@ public class SSTableMetadata
         protected EstimatedHistogram estimatedRowSize = defaultRowSizeHistogram();
         protected EstimatedHistogram estimatedColumnCount = defaultColumnCountHistogram();
         protected ReplayPosition replayPosition = ReplayPosition.NONE;
+        protected long minTimestamp = Long.MAX_VALUE;
         protected long maxTimestamp = Long.MIN_VALUE;
-        protected double compressionRatio = Double.MIN_VALUE;
+        protected double compressionRatio = NO_COMPRESSION_RATIO;
         protected Set<Integer> ancestors = new HashSet<Integer>();
         protected StreamingHistogram estimatedTombstoneDropTime = defaultTombstoneDropTimeHistogram();
 
@@ -157,6 +172,11 @@ public class SSTableMetadata
             compressionRatio = (double) compressed/uncompressed;
         }
 
+        public void updateMinTimestamp(long potentialMin)
+        {
+            minTimestamp = Math.min(minTimestamp, potentialMin);
+        }
+
         public void updateMaxTimestamp(long potentialMax)
         {
             maxTimestamp = Math.max(maxTimestamp, potentialMax);
@@ -167,6 +187,7 @@ public class SSTableMetadata
             return new SSTableMetadata(estimatedRowSize,
                                        estimatedColumnCount,
                                        replayPosition,
+                                       minTimestamp,
                                        maxTimestamp,
                                        compressionRatio,
                                        partitioner,
@@ -200,6 +221,7 @@ public class SSTableMetadata
 
         void update(long size, ColumnStats stats)
         {
+            updateMinTimestamp(stats.minTimestamp);
             /*
              * The max timestamp is not always collected here (more precisely, row.maxTimestamp() may return Long.MIN_VALUE),
              * to avoid deserializing an EchoedRow.
@@ -225,6 +247,7 @@ public class SSTableMetadata
             EstimatedHistogram.serializer.serialize(sstableStats.estimatedRowSize, dos);
             EstimatedHistogram.serializer.serialize(sstableStats.estimatedColumnCount, dos);
             ReplayPosition.serializer.serialize(sstableStats.replayPosition, dos);
+            dos.writeLong(sstableStats.minTimestamp);
             dos.writeLong(sstableStats.maxTimestamp);
             dos.writeDouble(sstableStats.compressionRatio);
             dos.writeUTF(sstableStats.partitioner);
@@ -262,12 +285,21 @@ public class SSTableMetadata
             ReplayPosition replayPosition = desc.version.metadataIncludesReplayPosition
                                           ? ReplayPosition.serializer.deserialize(dis)
                                           : ReplayPosition.NONE;
+            if (!desc.version.metadataIncludesModernReplayPosition)
+            {
+                // replay position may be "from the future" thanks to older versions generating them with nanotime.
+                // make sure we don't omit replaying something that we should.  see CASSANDRA-4782
+                replayPosition = ReplayPosition.NONE;
+            }
+            long minTimestamp = desc.version.tracksMinTimestamp ? dis.readLong() : Long.MIN_VALUE;
+            if (!desc.version.tracksMinTimestamp)
+                minTimestamp = Long.MAX_VALUE;
             long maxTimestamp = desc.version.containsTimestamp() ? dis.readLong() : Long.MIN_VALUE;
             if (!desc.version.tracksMaxTimestamp) // see javadoc to Descriptor.containsTimestamp
-                maxTimestamp = Long.MIN_VALUE;
+                maxTimestamp = Long.MAX_VALUE;
             double compressionRatio = desc.version.hasCompressionRatio
                                     ? dis.readDouble()
-                                    : Double.MIN_VALUE;
+                                    : NO_COMPRESSION_RATIO;
             String partitioner = desc.version.hasPartitioner ? dis.readUTF() : null;
             int nbAncestors = desc.version.hasAncestors ? dis.readInt() : 0;
             Set<Integer> ancestors = new HashSet<Integer>(nbAncestors);
@@ -276,7 +308,7 @@ public class SSTableMetadata
             StreamingHistogram tombstoneHistogram = desc.version.tracksTombstones
                                                    ? StreamingHistogram.serializer.deserialize(dis)
                                                    : defaultTombstoneDropTimeHistogram();
-            return new SSTableMetadata(rowSizes, columnCounts, replayPosition, maxTimestamp, compressionRatio, partitioner, ancestors, tombstoneHistogram);
+            return new SSTableMetadata(rowSizes, columnCounts, replayPosition, minTimestamp, maxTimestamp, compressionRatio, partitioner, ancestors, tombstoneHistogram);
         }
     }
 }

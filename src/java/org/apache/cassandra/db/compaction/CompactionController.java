@@ -20,6 +20,7 @@ package org.apache.cassandra.db.compaction;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,6 +45,7 @@ public class CompactionController
 
     public final ColumnFamilyStore cfs;
     private final DataTracker.SSTableIntervalTree overlappingTree;
+    private final Set<SSTableReader> overlappingSSTables;
 
     public final int gcBefore;
     public final int mergeShardBefore;
@@ -62,16 +64,24 @@ public class CompactionController
         }
     });
 
-    public CompactionController(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int gcBefore, boolean forceDeserialize)
+    public CompactionController(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int gcBefore)
     {
         this(cfs,
              gcBefore,
-             DataTracker.buildIntervalTree(cfs.getOverlappingSSTables(sstables)));
+             cfs.getAndReferenceOverlappingSSTables(sstables));
     }
 
-    protected CompactionController(ColumnFamilyStore cfs,
+    /**
+     * Constructor that subclasses may use when overriding shouldPurge to not need overlappingTree
+     */
+    protected CompactionController(ColumnFamilyStore cfs, int maxValue)
+    {
+        this(cfs, maxValue, null);
+    }
+
+    private CompactionController(ColumnFamilyStore cfs,
                                    int gcBefore,
-                                   DataTracker.SSTableIntervalTree overlappingTree)
+                                   Set<SSTableReader> overlappingSSTables)
     {
         assert cfs != null;
         this.cfs = cfs;
@@ -81,29 +91,30 @@ public class CompactionController
         // add 5 minutes to be sure we're on the safe side in terms of thread safety (though we should be fine in our
         // current 'stop all write during memtable switch' situation).
         this.mergeShardBefore = (int) ((cfs.oldestUnflushedMemtable() + 5 * 3600) / 1000);
-        this.overlappingTree = overlappingTree;
+        this.overlappingSSTables = overlappingSSTables == null ? Collections.<SSTableReader>emptySet() : overlappingSSTables;
+        overlappingTree = overlappingSSTables == null ? null : DataTracker.buildIntervalTree(overlappingSSTables);
     }
 
     public String getKeyspace()
     {
-        return cfs.table.name;
+        return cfs.table.getName();
     }
 
     public String getColumnFamily()
     {
-        return cfs.columnFamily;
+        return cfs.name;
     }
 
     /**
      * @return true if it's okay to drop tombstones for the given row, i.e., if we know all the verisons of the row
      * are included in the compaction set
      */
-    public boolean shouldPurge(DecoratedKey key)
+    public boolean shouldPurge(DecoratedKey key, long maxDeletionTimestamp)
     {
         List<SSTableReader> filteredSSTables = overlappingTree.search(key);
         for (SSTableReader sstable : filteredSSTables)
         {
-            if (sstable.getBloomFilter().isPresent(key.key))
+            if (sstable.getBloomFilter().isPresent(key.key) && sstable.getMinTimestamp() >= maxDeletionTimestamp)
                 return false;
         }
         return true;
@@ -145,7 +156,7 @@ public class CompactionController
         {
             String keyString = cfs.metadata.getKeyValidator().getString(rows.get(0).getKey().key);
             logger.info(String.format("Compacting large row %s/%s:%s (%d bytes) incrementally",
-                                      cfs.table.name, cfs.columnFamily, keyString, rowSize));
+                                      cfs.table.getName(), cfs.name, keyString, rowSize));
             return new LazilyCompactedRow(this, rows);
         }
         return new PrecompactedRow(this, rows);
@@ -160,5 +171,10 @@ public class CompactionController
     public void mayThrottle(long currentBytes)
     {
         throttle.throttle(currentBytes);
+    }
+
+    public void close()
+    {
+        SSTableReader.releaseReferences(overlappingSSTables);
     }
 }

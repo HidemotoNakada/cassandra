@@ -34,7 +34,6 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.io.FSWriteError;
-import org.apache.cassandra.io.util.*;
 import org.apache.cassandra.metrics.CommitLogMetrics;
 import org.apache.cassandra.net.MessagingService;
 
@@ -122,7 +121,7 @@ public class CommitLog implements CommitLogMBean
         }
         else
         {
-            Arrays.sort(files, new FileUtils.FileComparator());
+            Arrays.sort(files, new CommitLogSegment.CommitLogSegmentFileComparator());
             logger.info("Replaying " + StringUtils.join(files, ", "));
             replayed = recover(files);
             logger.info("Log replay complete, " + replayed + " replayed mutations");
@@ -226,16 +225,22 @@ public class CommitLog implements CommitLogMBean
                     // If the segment is no longer needed, and we have another spare segment in the hopper
                     // (to keep the last segment from getting discarded), pursue either recycling or deleting
                     // this segment file.
-                    if (segment.isUnused() && iter.hasNext())
+                    if (iter.hasNext())
                     {
-                        logger.debug("Commit log segment {} is unused", segment);
-                        allocator.recycleSegment(segment);
+                        if (segment.isUnused())
+                        {
+                            logger.debug("Commit log segment {} is unused", segment);
+                            allocator.recycleSegment(segment);
+                        }
+                        else
+                        {
+                            logger.debug("Not safe to delete commit log segment {}; dirty is {}",
+                                         segment, segment.dirtyString());
+                        }
                     }
                     else
                     {
-                        if (logger.isDebugEnabled())
-                            logger.debug(String.format("Not safe to delete commit log %s; dirty is %s; hasNext: %s",
-                                                       segment, segment.dirtyString(), iter.hasNext()));
+                        logger.debug("Not deleting active commitlog segment {}", segment);
                     }
 
                     // Don't mark or try to delete any newer segments once we've reached the one containing the

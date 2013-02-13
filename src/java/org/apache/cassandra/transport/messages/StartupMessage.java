@@ -19,12 +19,13 @@ package org.apache.cassandra.transport.messages;
 
 import java.util.Map;
 
-import com.google.common.base.Charsets;
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.*;
 import org.apache.cassandra.utils.SemanticVersion;
 
@@ -65,45 +66,44 @@ public class StartupMessage extends Message.Request
         return codec.encode(this);
     }
 
-    public Message.Response execute()
+    public Message.Response execute(QueryState state)
     {
-        try
+        ClientState cState = state.getClientState();
+        String cqlVersion = options.get(CQL_VERSION);
+        if (cqlVersion == null)
+            throw new ProtocolException("Missing value CQL_VERSION in STARTUP message");
+
+        try 
         {
-            assert connection instanceof ServerConnection;
-            ServerConnection c = (ServerConnection)connection;
-
-            String cqlVersion = options.get(CQL_VERSION);
-            if (cqlVersion == null)
-                throw new ProtocolException("Missing value CQL_VERSION in STARTUP message");
-
-            c.clientState().setCQLVersion(cqlVersion);
-            if (c.clientState().getCQLVersion().compareTo(new SemanticVersion("2.99.0")) < 0)
-                throw new ProtocolException(String.format("CQL version %s is not support by the binary protocol (supported version are >= 3.0.0)", cqlVersion));
-
-            if (options.containsKey(COMPRESSION))
-            {
-                String compression = options.get(COMPRESSION).toLowerCase();
-                if (compression.equals("snappy"))
-                {
-                    if (FrameCompressor.SnappyCompressor.instance == null)
-                        throw new ProtocolException("This instance does not support Snappy compression");
-                    connection.setCompressor(FrameCompressor.SnappyCompressor.instance);
-                }
-                else
-                {
-                    throw new ProtocolException(String.format("Unknown compression algorithm: %s", compression));
-                }
-            }
-
-            if (c.clientState().isLogged())
-                return new ReadyMessage();
-            else
-                return new AuthenticateMessage(DatabaseDescriptor.getAuthenticator().getClass().getName());
+            cState.setCQLVersion(cqlVersion);
         }
         catch (InvalidRequestException e)
         {
-            return ErrorMessage.fromException(new ProtocolException(e.getMessage()));
+            throw new ProtocolException(e.getMessage());
         }
+
+        if (cState.getCQLVersion().compareTo(new SemanticVersion("2.99.0")) < 0)
+            throw new ProtocolException(String.format("CQL version %s is not supported by the binary protocol (supported version are >= 3.0.0)", cqlVersion));
+
+        if (options.containsKey(COMPRESSION))
+        {
+            String compression = options.get(COMPRESSION).toLowerCase();
+            if (compression.equals("snappy"))
+            {
+                if (FrameCompressor.SnappyCompressor.instance == null)
+                    throw new ProtocolException("This instance does not support Snappy compression");
+                connection.setCompressor(FrameCompressor.SnappyCompressor.instance);
+            }
+            else
+            {
+                throw new ProtocolException(String.format("Unknown compression algorithm: %s", compression));
+            }
+        }
+
+        if (DatabaseDescriptor.getAuthenticator().requireAuthentication())
+            return new AuthenticateMessage(DatabaseDescriptor.getAuthenticator().getClass().getName());
+        else
+            return new ReadyMessage();
     }
 
     @Override

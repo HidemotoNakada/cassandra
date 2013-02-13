@@ -23,6 +23,9 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.Socket;
+import java.net.SocketException;
+import java.nio.ByteBuffer;
+import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -30,7 +33,10 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.tracing.TraceState;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.UUIDGen;
 import org.xerial.snappy.SnappyOutputStream;
 
 import org.apache.cassandra.config.Config;
@@ -41,6 +47,7 @@ public class OutboundTcpConnection extends Thread
     private static final Logger logger = LoggerFactory.getLogger(OutboundTcpConnection.class);
 
     private static final MessageOut CLOSE_SENTINEL = new MessageOut(MessagingService.Verb.INTERNAL_RESPONSE);
+    private volatile boolean isStopped = false;
 
     private static final int OPEN_RETRY_DELAY = 100; // ms between retries
 
@@ -83,10 +90,11 @@ public class OutboundTcpConnection extends Thread
         }
     }
 
-    void closeSocket()
+    void closeSocket(boolean destroyThread)
     {
         active.clear();
         backlog.clear();
+        isStopped = destroyThread; // Exit loop to stop the thread
         enqueue(CLOSE_SENTINEL, null);
     }
 
@@ -126,6 +134,8 @@ public class OutboundTcpConnection extends Thread
             if (m == CLOSE_SENTINEL)
             {
                 disconnect();
+                if (isStopped)
+                    break;
                 continue;
             }
             if (qm.timestamp < System.currentTimeMillis() - m.getTimeout())
@@ -164,6 +174,15 @@ public class OutboundTcpConnection extends Thread
     {
         try
         {
+            byte[] sessionBytes = qm.message.parameters.get(Tracing.TRACE_HEADER);
+            if (sessionBytes != null)
+            {
+                UUID sessionId = UUIDGen.getUUID(ByteBuffer.wrap(sessionBytes));
+                TraceState state = Tracing.instance().get(sessionId);
+                state.trace("Sending message to {}", poolReference.endPoint());
+                Tracing.instance().stopIfNonLocal(state);
+            }
+
             write(qm.message, qm.id, qm.timestamp, out, targetVersion);
             completed++;
             if (active.peek() == null)
@@ -227,8 +246,8 @@ public class OutboundTcpConnection extends Thread
             }
             catch (IOException e)
             {
-                if (logger.isDebugEnabled())
-                    logger.debug("exception closing connection to " + poolReference.endPoint(), e);
+                if (logger.isTraceEnabled())
+                    logger.trace("exception closing connection to " + poolReference.endPoint(), e);
             }
             out = null;
             socket = null;
@@ -249,7 +268,25 @@ public class OutboundTcpConnection extends Thread
             {
                 socket = poolReference.newSocket();
                 socket.setKeepAlive(true);
-                socket.setTcpNoDelay(true);
+                if (isLocalDC(poolReference.endPoint()))
+                {
+                    socket.setTcpNoDelay(true);
+                }
+                else
+                {
+                    socket.setTcpNoDelay(DatabaseDescriptor.getInterDCTcpNoDelay());
+                }
+                if (DatabaseDescriptor.getInternodeSendBufferSize() != null)
+                {
+                    try
+                    {
+                        socket.setSendBufferSize(DatabaseDescriptor.getInternodeSendBufferSize().intValue());
+                    }
+                    catch (SocketException se)
+                    {
+                        logger.warn("Failed to set send buffer size on internode socket.", se);
+                    }
+                }
                 out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 4096));
 
                 if (targetVersion >= MessagingService.VERSION_12)
@@ -270,7 +307,7 @@ public class OutboundTcpConnection extends Thread
 
                     if (targetVersion < maxTargetVersion && targetVersion < MessagingService.current_version)
                     {
-                        logger.debug("Detected higher max version {} (using {}); will reconnect when queued messages are done",
+                        logger.trace("Detected higher max version {} (using {}); will reconnect when queued messages are done",
                                      maxTargetVersion, targetVersion);
                         MessagingService.instance().setVersion(poolReference.endPoint(), Math.min(MessagingService.current_version, maxTargetVersion));
                         softCloseSocket();
@@ -281,7 +318,7 @@ public class OutboundTcpConnection extends Thread
                     if (shouldCompressConnection())
                     {
                         out.flush();
-                        logger.debug("Upgrading OutputStream to be compressed");
+                        logger.trace("Upgrading OutputStream to be compressed");
                         out = new DataOutputStream(new SnappyOutputStream(new BufferedOutputStream(socket.getOutputStream())));
                     }
                 }

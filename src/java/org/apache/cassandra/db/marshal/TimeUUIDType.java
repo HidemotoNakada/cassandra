@@ -19,9 +19,11 @@ package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
 import java.util.UUID;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.apache.cassandra.cql.jdbc.JdbcTimeUUID;
+import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.UUIDGen;
 
@@ -100,7 +102,10 @@ public class TimeUUIDType extends AbstractType<UUID>
         }
     }
 
-    public ByteBuffer fromString(String source) throws MarshalException
+    // This accepts dates are valid TimeUUID represensation, which is bogus
+    // (see #4936) but kept for CQL2 for compatibility sake.
+    @Override
+    public ByteBuffer fromStringCQL2(String source) throws MarshalException
     {
         // Return an empty ByteBuffer for an empty string.
         if (source.isEmpty())
@@ -133,6 +138,38 @@ public class TimeUUIDType extends AbstractType<UUID>
         return idBytes;
     }
 
+    public ByteBuffer fromString(String source) throws MarshalException
+    {
+        // Return an empty ByteBuffer for an empty string.
+        if (source.isEmpty())
+            return ByteBufferUtil.EMPTY_BYTE_BUFFER;
+
+        ByteBuffer idBytes = null;
+
+        // ffffffff-ffff-ffff-ffff-ffffffffff
+        if (regexPattern.matcher(source).matches())
+        {
+            UUID uuid = null;
+            try
+            {
+                uuid = UUID.fromString(source);
+                idBytes = decompose(uuid);
+            }
+            catch (IllegalArgumentException e)
+            {
+                throw new MarshalException(String.format("Unable to make UUID from '%s'", source), e);
+            }
+
+            if (uuid.version() != 1)
+                throw new MarshalException("TimeUUID supports only version 1 UUIDs");
+        }
+        else
+        {
+            throw new MarshalException(String.format("Unknown timeuuid representation: %s", source));
+        }
+        return idBytes;
+    }
+
     public void validate(ByteBuffer bytes) throws MarshalException
     {
         if (bytes.remaining() != 16 && bytes.remaining() != 0)
@@ -145,5 +182,10 @@ public class TimeUUIDType extends AbstractType<UUID>
             if ((slice.get() & 0xf0) != 0x10)
                 throw new MarshalException("Invalid version for TimeUUID type.");
         }
+    }
+
+    public CQL3Type asCQL3Type()
+    {
+        return CQL3Type.Native.TIMEUUID;
     }
 }

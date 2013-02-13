@@ -17,26 +17,41 @@
  */
 package org.apache.cassandra.transport;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.util.EnumMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.service.CassandraDaemon;
+import org.apache.cassandra.service.IEndpointLifecycleSubscriber;
+import org.apache.cassandra.service.IMigrationListener;
+import org.apache.cassandra.service.MigrationManager;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.transport.messages.EventMessage;
 import org.jboss.netty.bootstrap.ServerBootstrap;
-import org.jboss.netty.channel.*;
+import org.jboss.netty.channel.Channel;
+import org.jboss.netty.channel.ChannelFactory;
+import org.jboss.netty.channel.ChannelPipeline;
+import org.jboss.netty.channel.ChannelPipelineFactory;
+import org.jboss.netty.channel.Channels;
 import org.jboss.netty.channel.group.ChannelGroup;
 import org.jboss.netty.channel.group.DefaultChannelGroup;
 import org.jboss.netty.channel.socket.nio.NioServerSocketChannelFactory;
 import org.jboss.netty.handler.execution.ExecutionHandler;
+import org.jboss.netty.handler.ssl.SslHandler;
 import org.jboss.netty.logging.InternalLoggerFactory;
 import org.jboss.netty.logging.Slf4JLoggerFactory;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.cassandra.gms.*;
-import org.apache.cassandra.service.CassandraDaemon;
-import org.apache.cassandra.transport.messages.EventMessage;
 
 public class Server implements CassandraDaemon.Server
 {
@@ -58,7 +73,9 @@ public class Server implements CassandraDaemon.Server
     public Server(InetSocketAddress socket)
     {
         this.socket = socket;
-        Gossiper.instance.register(new EventNotifier(this));
+        EventNotifier notifier = new EventNotifier(this);
+        StorageService.instance.register(notifier);
+        MigrationManager.instance.register(notifier);
     }
 
     public Server(String hostname, int port)
@@ -100,8 +117,19 @@ public class Server implements CassandraDaemon.Server
         factory = new NioServerSocketChannelFactory(Executors.newCachedThreadPool(), Executors.newCachedThreadPool());
         ServerBootstrap bootstrap = new ServerBootstrap(factory);
 
+        bootstrap.setOption("child.tcpNoDelay", true);
+
         // Set up the event pipeline factory.
-        bootstrap.setPipelineFactory(new PipelineFactory(this));
+        final EncryptionOptions.ClientEncryptionOptions clientEnc = DatabaseDescriptor.getClientEncryptionOptions();
+        if (clientEnc.enabled)
+        {
+            logger.info("enabling encrypted CQL connections between client and server");
+            bootstrap.setPipelineFactory(new SecurePipelineFactory(this, clientEnc));
+        }
+        else
+        {
+            bootstrap.setPipelineFactory(new PipelineFactory(this));
+        }
 
         // Bind and start to accept incoming connections.
         logger.info("Starting listening for CQL clients on " + socket + "...");
@@ -197,44 +225,131 @@ public class Server implements CassandraDaemon.Server
       }
     }
 
-    private static class EventNotifier implements IEndpointStateChangeSubscriber
+    private static class SecurePipelineFactory extends PipelineFactory
+    {
+        private final SSLContext sslContext;
+        private final EncryptionOptions encryptionOptions;
+
+        public SecurePipelineFactory(Server server, EncryptionOptions encryptionOptions)
+        {
+            super(server);
+            this.encryptionOptions = encryptionOptions;
+            try
+            {
+                this.sslContext = SSLFactory.createSSLContext(encryptionOptions, false);
+            }
+            catch (IOException e)
+            {
+                throw new RuntimeException("Failed to setup secure pipeline", e);
+            }
+        }
+
+        public ChannelPipeline getPipeline() throws Exception
+        {
+            SSLEngine sslEngine = sslContext.createSSLEngine();
+            sslEngine.setUseClientMode(false);
+            sslEngine.setEnabledCipherSuites(encryptionOptions.cipher_suites);
+            sslEngine.setNeedClientAuth(encryptionOptions.require_client_auth);
+            
+            SslHandler sslHandler = new SslHandler(sslEngine);
+            sslHandler.setIssueHandshake(true);
+            ChannelPipeline pipeline = super.getPipeline();
+            pipeline.addFirst("ssl", sslHandler);
+            return pipeline;
+        }
+    }
+
+    private static class EventNotifier implements IEndpointLifecycleSubscriber, IMigrationListener
     {
         private final Server server;
+        private static final InetAddress bindAll;
+        static {
+            try
+            {
+                bindAll = InetAddress.getByAddress(new byte[4]);
+            }
+            catch (UnknownHostException e)
+            {
+                throw new AssertionError(e);
+            }
+        }
 
         private EventNotifier(Server server)
         {
             this.server = server;
         }
 
-        public void onJoin(InetAddress endpoint, EndpointState epState)
+        private InetAddress getRpcAddress(InetAddress endpoint)
         {
-            // TODO: we don't gossip the native protocol ip/port yet, so use the
-            // endpoint address and ip on which this server is listening instead.
-            server.connectionTracker.send(Event.TopologyChange.newNode(endpoint, server.socket.getPort()));
+            try
+            {
+                InetAddress rpcAddress = InetAddress.getByName(StorageService.instance.getRpcaddress(endpoint));
+                // If rpcAddress == 0.0.0.0 (i.e. bound on all addresses), returning that is not very helpful,
+                // so return the internal address (which is ok since "we're bound on all addresses").
+                return rpcAddress.equals(bindAll) ? endpoint : rpcAddress;
+            }
+            catch (UnknownHostException e)
+            {
+                // That should not happen, so log an error, but return the
+                // endpoint address since there's a good change this is right
+                logger.error("Problem retrieving RPC address for " + endpoint, e);
+                return endpoint;
+            }
         }
 
-        public void onChange(InetAddress endpoint, ApplicationState state, VersionedValue value)
+        public void onJoinCluster(InetAddress endpoint)
         {
+            server.connectionTracker.send(Event.TopologyChange.newNode(getRpcAddress(endpoint), server.socket.getPort()));
         }
 
-        public void onAlive(InetAddress endpoint, EndpointState state)
+        public void onLeaveCluster(InetAddress endpoint)
         {
-            server.connectionTracker.send(Event.StatusChange.nodeUp(endpoint, server.socket.getPort()));
+            server.connectionTracker.send(Event.TopologyChange.removedNode(getRpcAddress(endpoint), server.socket.getPort()));
         }
 
-        public void onDead(InetAddress endpoint, EndpointState state)
+        public void onMove(InetAddress endpoint)
         {
-            server.connectionTracker.send(Event.StatusChange.nodeDown(endpoint, server.socket.getPort()));
+            server.connectionTracker.send(Event.TopologyChange.movedNode(getRpcAddress(endpoint), server.socket.getPort()));
         }
 
-        public void onRemove(InetAddress endpoint)
+        public void onUp(InetAddress endpoint)
         {
-            server.connectionTracker.send(Event.TopologyChange.removedNode(endpoint, server.socket.getPort()));
+            server.connectionTracker.send(Event.StatusChange.nodeUp(getRpcAddress(endpoint), server.socket.getPort()));
         }
 
-        public void onRestart(InetAddress endpoint, EndpointState state)
+        public void onDown(InetAddress endpoint)
         {
-            server.connectionTracker.send(Event.StatusChange.nodeUp(endpoint, server.socket.getPort()));
+            server.connectionTracker.send(Event.StatusChange.nodeDown(getRpcAddress(endpoint), server.socket.getPort()));
+        }
+
+        public void onCreateKeyspace(String ksName)
+        {
+            server.connectionTracker.send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, ksName));
+        }
+
+        public void onCreateColumnFamily(String ksName, String cfName)
+        {
+            server.connectionTracker.send(new Event.SchemaChange(Event.SchemaChange.Change.CREATED, ksName, cfName));
+        }
+
+        public void onUpdateKeyspace(String ksName)
+        {
+            server.connectionTracker.send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, ksName));
+        }
+
+        public void onUpdateColumnFamily(String ksName, String cfName)
+        {
+            server.connectionTracker.send(new Event.SchemaChange(Event.SchemaChange.Change.UPDATED, ksName, cfName));
+        }
+
+        public void onDropKeyspace(String ksName)
+        {
+            server.connectionTracker.send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, ksName));
+        }
+
+        public void onDropColumnFamily(String ksName, String cfName)
+        {
+            server.connectionTracker.send(new Event.SchemaChange(Event.SchemaChange.Change.DROPPED, ksName, cfName));
         }
     }
 }

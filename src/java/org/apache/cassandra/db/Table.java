@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -68,12 +69,19 @@ public class Table
             DatabaseDescriptor.createAllDirectories();
     }
 
-    /* Table name. */
-    public final String name;
+    public final KSMetaData metadata;
+
     /* ColumnFamilyStore per column family */
-    private final Map<UUID, ColumnFamilyStore> columnFamilyStores = new ConcurrentHashMap<UUID, ColumnFamilyStore>();
+    private final ConcurrentMap<UUID, ColumnFamilyStore> columnFamilyStores = new ConcurrentHashMap<UUID, ColumnFamilyStore>();
     private final Object[] indexLocks;
     private volatile AbstractReplicationStrategy replicationStrategy;
+    public static final Function<String,Table> tableTransformer = new Function<String, Table>()
+    {
+        public Table apply(String tableName)
+        {
+            return Table.open(tableName);
+        }
+    };
 
     public static Table open(String table)
     {
@@ -153,9 +161,9 @@ public class Table
 
     public ColumnFamilyStore getColumnFamilyStore(String cfName)
     {
-        UUID id = Schema.instance.getId(name, cfName);
+        UUID id = Schema.instance.getId(getName(), cfName);
         if (id == null)
-            throw new IllegalArgumentException(String.format("Unknown table/cf pair (%s.%s)", name, cfName));
+            throw new IllegalArgumentException(String.format("Unknown table/cf pair (%s.%s)", getName(), cfName));
         return getColumnFamilyStore(id);
     }
 
@@ -181,7 +189,7 @@ public class Table
         boolean tookSnapShot = false;
         for (ColumnFamilyStore cfStore : columnFamilyStores.values())
         {
-            if (columnFamilyName == null || cfStore.columnFamily.equals(columnFamilyName))
+            if (columnFamilyName == null || cfStore.name.equals(columnFamilyName))
             {
                 tookSnapShot = true;
                 cfStore.snapshot(snapshotName);
@@ -250,12 +258,11 @@ public class Table
 
     private Table(String table, boolean loadSSTables)
     {
-        name = table;
-        KSMetaData ksm = Schema.instance.getKSMetaData(table);
-        assert ksm != null : "Unknown keyspace " + table;
+        metadata = Schema.instance.getKSMetaData(table);
+        assert metadata != null : "Unknown keyspace " + table;
         try
         {
-            createReplicationStrategy(ksm);
+            createReplicationStrategy(metadata);
         }
         catch (ConfigurationException e)
         {
@@ -266,9 +273,9 @@ public class Table
         for (int i = 0; i < indexLocks.length; i++)
             indexLocks[i] = new Object();
 
-        for (CFMetaData cfm : new ArrayList<CFMetaData>(Schema.instance.getTableDefinition(table).cfMetaData().values()))
+        for (CFMetaData cfm : new ArrayList<CFMetaData>(metadata.cfMetaData().values()))
         {
-            logger.debug("Initializing {}.{}", name, cfm.cfName);
+            logger.debug("Initializing {}.{}", getName(), cfm.cfName);
             initCf(cfm.cfId, cfm.cfName, loadSSTables);
         }
     }
@@ -319,19 +326,25 @@ public class Table
      */
     public void initCf(UUID cfId, String cfName, boolean loadSSTables)
     {
-        if (columnFamilyStores.containsKey(cfId))
-        {
-            // this is the case when you reset local schema
-            // just reload metadata
-            ColumnFamilyStore cfs = columnFamilyStores.get(cfId);
-            assert cfs.getColumnFamilyName().equals(cfName);
+        ColumnFamilyStore cfs = columnFamilyStores.get(cfId);
 
-            cfs.metadata.reload();
-            cfs.reload();
+        if (cfs == null)
+        {
+            // CFS being created for the first time, either on server startup or new CF being added.
+            // We don't worry about races here; startup is safe, and adding multiple idential CFs
+            // simultaneously is a "don't do that" scenario.
+            ColumnFamilyStore oldCfs = columnFamilyStores.putIfAbsent(cfId, ColumnFamilyStore.createColumnFamilyStore(this, cfName, loadSSTables));
+            // CFS mbean instantiation will error out before we hit this, but in case that changes...
+            if (oldCfs != null)
+                throw new IllegalStateException("added multiple mappings for cf id " + cfId);
         }
         else
         {
-            columnFamilyStores.put(cfId, ColumnFamilyStore.createColumnFamilyStore(this, cfName, loadSSTables));
+            // re-initializing an existing CF.  This will happen if you cleared the schema
+            // on this node and it's getting repopulated from the rest of the cluster.
+            assert cfs.name.equals(cfName);
+            cfs.metadata.reload();
+            cfs.reload();
         }
     }
 
@@ -358,14 +371,17 @@ public class Table
     public void apply(RowMutation mutation, boolean writeCommitLog, boolean updateIndexes)
     {
         if (!mutation.getTable().equals(Tracing.TRACE_KS))
-            logger.debug("applying mutation");
+            Tracing.trace("Acquiring switchLock read lock");
 
         // write the mutation to the commitlog and memtables
         switchLock.readLock().lock();
         try
         {
             if (writeCommitLog)
+            {
+                Tracing.trace("Appending to commitlog");
                 CommitLog.instance.add(mutation);
+            }
 
             DecoratedKey key = StorageService.getPartitioner().decorateKey(mutation.key());
             for (ColumnFamily cf : mutation.getColumnFamilies())
@@ -377,6 +393,7 @@ public class Table
                     continue;
                 }
 
+                Tracing.trace("Adding to {} memtable", cf.metadata().cfName);
                 cfs.apply(key, cf, updateIndexes ? cfs.indexManager.updaterFor(key, true) : SecondaryIndexManager.nullUpdater);
             }
         }
@@ -415,7 +432,7 @@ public class Table
                 {
                     ColumnFamily cf = pager.next();
                     ColumnFamily cf2 = cf.cloneMeShallow();
-                    for (IColumn column : cf)
+                    for (Column column : cf)
                     {
                         if (cfs.indexManager.indexes(column.name(), indexes))
                             cf2.addColumn(column);
@@ -439,29 +456,33 @@ public class Table
     {
         List<Future<?>> futures = new ArrayList<Future<?>>();
         for (UUID cfId : columnFamilyStores.keySet())
-        {
-            Future<?> future = columnFamilyStores.get(cfId).forceFlush();
-            if (future != null)
-                futures.add(future);
-        }
+            futures.add(columnFamilyStores.get(cfId).forceFlush());
         return futures;
     }
 
     public static Iterable<Table> all()
     {
-        Function<String, Table> transformer = new Function<String, Table>()
-        {
-            public Table apply(String tableName)
-            {
-                return Table.open(tableName);
-            }
-        };
-        return Iterables.transform(Schema.instance.getTables(), transformer);
+        return Iterables.transform(Schema.instance.getTables(), tableTransformer);
+    }
+
+    public static Iterable<Table> nonSystem()
+    {
+        return Iterables.transform(Schema.instance.getNonSystemTables(), tableTransformer);
+    }
+
+    public static Iterable<Table> system()
+    {
+        return Iterables.transform(Schema.systemKeyspaceNames, tableTransformer);
     }
 
     @Override
     public String toString()
     {
-        return getClass().getSimpleName() + "(name='" + name + "')";
+        return getClass().getSimpleName() + "(name='" + getName() + "')";
+    }
+
+    public String getName()
+    {
+        return metadata.name;
     }
 }

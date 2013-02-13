@@ -25,6 +25,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import com.google.common.collect.AbstractIterator;
@@ -128,6 +129,18 @@ public class UntypedResultSet implements Iterable<UntypedResultSet.Row>
         public Date getTimestamp(String column)
         {
             return DateType.instance.compose(data.get(column));
+        }
+
+        public <T> Set<T> getSet(String column, AbstractType<T> type)
+        {
+            ByteBuffer raw = data.get(column);
+            return raw == null ? null : SetType.getInstance(type).compose(raw);
+        }
+
+        public <K, V> Map<K, V> getMap(String column, AbstractType<K> keyType, AbstractType<V> valueType)
+        {
+            ByteBuffer raw = data.get(column);
+            return raw == null ? null : MapType.getInstance(keyType, valueType).compose(raw);
         }
 
         @Override

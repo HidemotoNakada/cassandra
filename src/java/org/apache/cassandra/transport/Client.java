@@ -21,19 +21,33 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 
 import com.google.common.base.Splitter;
 
-import org.apache.cassandra.transport.messages.*;
-import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.transport.messages.CredentialsMessage;
+import org.apache.cassandra.transport.messages.ExecuteMessage;
+import org.apache.cassandra.transport.messages.OptionsMessage;
+import org.apache.cassandra.transport.messages.PrepareMessage;
+import org.apache.cassandra.transport.messages.QueryMessage;
+import org.apache.cassandra.transport.messages.RegisterMessage;
+import org.apache.cassandra.transport.messages.StartupMessage;
 import org.apache.cassandra.utils.Hex;
+import static org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOptions;
 
 public class Client extends SimpleClient
 {
-    public Client(String host, int port)
+    public Client(String host, int port, ClientEncryptionOptions encryptionOptions)
     {
-        super(host, port);
+        super(host, port, encryptionOptions);
     }
 
     public void run() throws IOException
@@ -99,7 +113,7 @@ public class Client extends SimpleClient
         else if (msgType.equals("QUERY"))
         {
             String query = line.substring(6);
-            return new QueryMessage(query);
+            return new QueryMessage(query, ConsistencyLevel.ONE);
         }
         else if (msgType.equals("PREPARE"))
         {
@@ -127,7 +141,7 @@ public class Client extends SimpleClient
                     }
                     values.add(bb);
                 }
-                return new ExecuteMessage(id, values);
+                return new ExecuteMessage(id, values, ConsistencyLevel.ONE);
             }
             catch (Exception e)
             {
@@ -180,9 +194,10 @@ public class Client extends SimpleClient
         String host = args[0];
         int port = Integer.parseInt(args[1]);
 
+        ClientEncryptionOptions encryptionOptions = new ClientEncryptionOptions();
         System.out.println("CQL binary protocol console " + host + "@" + port);
 
-        new Client(host, port).run();
+        new Client(host, port, encryptionOptions).run();
         System.exit(0);
     }
 }

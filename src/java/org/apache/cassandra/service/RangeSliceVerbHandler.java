@@ -31,18 +31,19 @@ import org.apache.cassandra.db.Table;
 import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.tracing.Tracing;
 
 public class RangeSliceVerbHandler implements IVerbHandler<RangeSliceCommand>
 {
     private static final Logger logger = LoggerFactory.getLogger(RangeSliceVerbHandler.class);
 
-    static List<Row> executeLocally(RangeSliceCommand command) throws ExecutionException, InterruptedException
+    public static List<Row> executeLocally(RangeSliceCommand command) throws ExecutionException, InterruptedException
     {
         ColumnFamilyStore cfs = Table.open(command.keyspace).getColumnFamilyStore(command.column_family);
         if (cfs.indexManager.hasIndexFor(command.row_filter))
-            return cfs.search(command.row_filter, command.range, command.maxResults, command.predicate, command.maxIsColumns);
+            return cfs.search(command.row_filter, command.range, command.maxResults, command.predicate, command.countCQL3Rows);
         else
-            return cfs.getRangeSlice(command.super_column, command.range, command.maxResults, command.predicate, command.row_filter, command.maxIsColumns, command.isPaging);
+            return cfs.getRangeSlice(command.range, command.maxResults, command.predicate, command.row_filter, command.countCQL3Rows, command.isPaging);
     }
 
     public void doVerb(MessageIn<RangeSliceCommand> message, String id)
@@ -55,8 +56,7 @@ public class RangeSliceVerbHandler implements IVerbHandler<RangeSliceCommand>
                 throw new RuntimeException("Cannot service reads while bootstrapping!");
             }
             RangeSliceReply reply = new RangeSliceReply(executeLocally(message.payload));
-            if (logger.isDebugEnabled())
-                logger.debug("Sending " + reply+ " to " + id + "@" + message.from);
+            Tracing.trace("Enqueuing response to {}", message.from);
             MessagingService.instance().sendReply(reply.createMessage(), id, message.from);
         }
         catch (Exception ex)

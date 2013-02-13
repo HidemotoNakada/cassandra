@@ -17,14 +17,13 @@
  */
 package org.apache.cassandra.db.marshal;
 
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.db.IColumn;
+import org.apache.cassandra.db.Column;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 
 public class MapType<K, V> extends CollectionType<Map<K, V>>
@@ -47,10 +46,10 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     public static synchronized <K, V> MapType<K, V> getInstance(AbstractType<K> keys, AbstractType<V> values)
     {
         Pair<AbstractType<?>, AbstractType<?>> p = Pair.<AbstractType<?>, AbstractType<?>>create(keys, values);
-        MapType t = instances.get(p);
+        MapType<K, V> t = instances.get(p);
         if (t == null)
         {
-            t = new MapType(keys, values);
+            t = new MapType<K, V>(keys, values);
             instances.put(p, t);
         }
         return t;
@@ -75,21 +74,33 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
 
     public Map<K, V> compose(ByteBuffer bytes)
     {
-        ByteBuffer input = bytes.duplicate();
-        int n = input.getShort();
-        Map<K, V> m = new LinkedHashMap<K, V>(n);
-        for (int i = 0; i < n; i++)
+        try
         {
-            int sk = input.getShort();
-            byte[] datak = new byte[sk];
-            input.get(datak);
+            ByteBuffer input = bytes.duplicate();
+            int n = input.getShort();
+            Map<K, V> m = new LinkedHashMap<K, V>(n);
+            for (int i = 0; i < n; i++)
+            {
+                int sk = input.getShort();
+                byte[] datak = new byte[sk];
+                input.get(datak);
+                ByteBuffer kbb = ByteBuffer.wrap(datak);
+                keys.validate(kbb);
 
-            int sv = input.getShort();
-            byte[] datav = new byte[sv];
-            input.get(datav);
-            m.put(keys.compose(ByteBuffer.wrap(datak)), values.compose(ByteBuffer.wrap(datav)));
+                int sv = input.getShort();
+                byte[] datav = new byte[sv];
+                input.get(datav);
+                ByteBuffer vbb = ByteBuffer.wrap(datav);
+                values.validate(vbb);
+
+                m.put(keys.compose(kbb), values.compose(vbb));
+            }
+            return m;
         }
-        return m;
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a map");
+        }
     }
 
     /**
@@ -124,11 +135,11 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
     /**
      * Creates the same output than decompose, but from the internal representation.
      */
-    public ByteBuffer serialize(List<Pair<ByteBuffer, IColumn>> columns)
+    public ByteBuffer serialize(List<Pair<ByteBuffer, Column>> columns)
     {
         List<ByteBuffer> bbs = new ArrayList<ByteBuffer>(2 * columns.size());
         int size = 0;
-        for (Pair<ByteBuffer, IColumn> p : columns)
+        for (Pair<ByteBuffer, Column> p : columns)
         {
             bbs.add(p.left);
             bbs.add(p.right.value());

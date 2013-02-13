@@ -20,7 +20,8 @@ package org.apache.cassandra.db.marshal;
 import java.nio.ByteBuffer;
 import java.util.List;
 
-import org.apache.cassandra.db.IColumn;
+import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.db.Column;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 
@@ -49,7 +50,7 @@ public abstract class CollectionType<T> extends AbstractType<T>
 
     protected abstract void appendToStringBuilder(StringBuilder sb);
 
-    public abstract ByteBuffer serialize(List<Pair<ByteBuffer, IColumn>> columns);
+    public abstract ByteBuffer serialize(List<Pair<ByteBuffer, Column>> columns);
 
     @Override
     public String toString()
@@ -92,7 +93,7 @@ public abstract class CollectionType<T> extends AbstractType<T>
     }
 
     // Utilitary method
-    protected ByteBuffer pack(List<ByteBuffer> buffers, int elements, int size)
+    protected static ByteBuffer pack(List<ByteBuffer> buffers, int elements, int size)
     {
         ByteBuffer result = ByteBuffer.allocate(2 + size);
         result.putShort((short)elements);
@@ -102,5 +103,18 @@ public abstract class CollectionType<T> extends AbstractType<T>
             result.put(bb.duplicate());
         }
         return (ByteBuffer)result.flip();
+    }
+
+    public static ByteBuffer pack(List<ByteBuffer> buffers, int elements)
+    {
+        int size = 0;
+        for (ByteBuffer bb : buffers)
+            size += 2 + bb.remaining();
+        return pack(buffers, elements, size);
+    }
+
+    public CQL3Type asCQL3Type()
+    {
+        return new CQL3Type.Collection(this);
     }
 }

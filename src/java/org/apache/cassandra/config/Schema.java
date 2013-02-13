@@ -18,6 +18,7 @@
 package org.apache.cassandra.config;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.*;
@@ -26,12 +27,14 @@ import com.google.common.collect.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.auth.Auth;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.Table;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
@@ -64,6 +67,7 @@ public class Schema
 
     // 59adb24e-f3cd-3e02-97f0-5b395827453f
     public static final UUID emptyVersion;
+    public static final ImmutableSet<String> systemKeyspaceNames = ImmutableSet.of(Table.SYSTEM_KS, Tracing.TRACE_KS, Auth.AUTH_KS);
 
     static
     {
@@ -136,10 +140,10 @@ public class Schema
      */
     public void storeTableInstance(Table table)
     {
-        if (tableInstances.containsKey(table.name))
-            throw new IllegalArgumentException(String.format("Table %s was already initialized.", table.name));
+        if (tableInstances.containsKey(table.getName()))
+            throw new IllegalArgumentException(String.format("Table %s was already initialized.", table.getName()));
 
-        tableInstances.put(table.name, table);
+        tableInstances.put(table.getName(), table);
     }
 
     /**
@@ -232,20 +236,6 @@ public class Schema
     }
 
     /**
-     * Get subComparator of the ColumnFamily
-     *
-     * @param ksName The keyspace name
-     * @param cfName The ColumnFamily name
-     *
-     * @return The subComparator of the ColumnFamily
-     */
-    public AbstractType<?> getSubComparator(String ksName, String cfName)
-    {
-        assert ksName != null;
-        return getCFMetaData(ksName, cfName).subcolumnComparator;
-    }
-
-    /**
      * Get value validator for specific column
      *
      * @param ksName The keyspace name
@@ -277,20 +267,7 @@ public class Schema
      */
     public List<String> getNonSystemTables()
     {
-        ImmutableSet<String> system = ImmutableSet.of(Table.SYSTEM_KS, Tracing.TRACE_KS);
-        return ImmutableList.copyOf(Sets.difference(tables.keySet(), system));
-    }
-
-    /**
-     * Get metadata about table by its name
-     *
-     * @param table The name of the table
-     *
-     * @return The table metadata or null if it wasn't found
-     */
-    public KSMetaData getTableDefinition(String table)
-    {
-        return getKSMetaData(table);
+        return ImmutableList.copyOf(Sets.difference(tables.keySet(), systemKeyspaceNames));
     }
 
     /**
@@ -387,8 +364,6 @@ public class Schema
      * (to make ColumnFamily lookup faster)
      *
      * @param cfm The ColumnFamily definition to load
-     *
-     * @throws ConfigurationException if ColumnFamily was already loaded
      */
     public void load(CFMetaData cfm)
     {
@@ -433,13 +408,14 @@ public class Schema
 
             for (Row row : SystemTable.serializedSchema())
             {
-                if (row.cf == null || (row.cf.isMarkedForDelete() && row.cf.isEmpty()))
+                if (invalidSchemaRow(row) || ignoredSchemaRow(row))
                     continue;
 
                 row.cf.updateDigest(versionDigest);
             }
 
             version = UUID.nameUUIDFromBytes(versionDigest.digest());
+            SystemTable.updateSchemaVersion(version);
         }
         catch (Exception e)
         {
@@ -463,12 +439,29 @@ public class Schema
     {
         for (String table : getNonSystemTables())
         {
-            KSMetaData ksm = getTableDefinition(table);
+            KSMetaData ksm = getKSMetaData(table);
             for (CFMetaData cfm : ksm.cfMetaData().values())
                 purge(cfm);
             clearTableDefinition(ksm);
         }
 
         updateVersionAndAnnounce();
+    }
+
+    public static boolean invalidSchemaRow(Row row)
+    {
+        return row.cf == null || (row.cf.isMarkedForDelete() && row.cf.isEmpty());
+    }
+
+    public static boolean ignoredSchemaRow(Row row)
+    {
+        try
+        {
+            return systemKeyspaceNames.contains(ByteBufferUtil.string(row.key.key));
+        }
+        catch (CharacterCodingException e)
+        {
+            throw new RuntimeException(e);
+        }
     }
 }

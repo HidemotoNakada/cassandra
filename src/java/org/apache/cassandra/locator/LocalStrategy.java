@@ -23,6 +23,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.cassandra.db.Table;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.dht.RingPosition;
 import org.apache.cassandra.dht.Token;
@@ -61,6 +62,6 @@ public class LocalStrategy extends AbstractReplicationStrategy
     public void validateOptions() throws ConfigurationException
     {
         // LocalStrategy doesn't expect any options.
-        warnOnUnexpectedOptions(Collections.<String>emptySet());
+        validateExpectedOptions(Collections.<String>emptySet());
     }
 }

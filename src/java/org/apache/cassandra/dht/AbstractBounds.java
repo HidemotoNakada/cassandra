@@ -23,8 +23,10 @@ import java.io.IOException;
 import java.io.Serializable;
 import java.util.*;
 
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.db.RowPosition;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.Pair;
@@ -89,6 +91,26 @@ public abstract class AbstractBounds<T extends RingPosition> implements Serializ
 
     public abstract List<? extends AbstractBounds<T>> unwrap();
 
+    public String getString(AbstractType<?> keyValidator)
+    {
+        return getOpeningString() + format(left, keyValidator) + ", " + format(right, keyValidator) + getClosingString();
+    }
+
+    private String format(T value, AbstractType<?> keyValidator)
+    {
+        if (value instanceof DecoratedKey)
+        {
+            return keyValidator.getString(((DecoratedKey)value).key);
+        }
+        else
+        {
+            return value.toString();
+        }
+    }
+
+    protected abstract String getOpeningString();
+    protected abstract String getClosingString();
+
     /**
      * Transform this abstract bounds to equivalent covering bounds of row positions.
      * If this abstract bounds was already an abstractBounds of row positions, this is a noop.
@@ -100,6 +122,8 @@ public abstract class AbstractBounds<T extends RingPosition> implements Serializ
      * If this abstract bounds was already an abstractBounds of token, this is a noop, otherwise this use the row position tokens.
      */
     public abstract AbstractBounds<Token> toTokenBounds();
+
+    public abstract AbstractBounds<T> withNewRight(T newRight);
 
     public static class AbstractBoundsSerializer implements IVersionedSerializer<AbstractBounds<?>>
     {

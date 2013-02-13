@@ -24,22 +24,23 @@ import java.util.*;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.sstable.IndexHelper;
-import org.apache.cassandra.utils.Filter;
+import org.apache.cassandra.utils.AlwaysPresentFilter;
+import org.apache.cassandra.utils.IFilter;
 import org.apache.cassandra.utils.FilterFactory;
 
 public class ColumnIndex
 {
     public final List<IndexHelper.IndexInfo> columnsIndex;
-    public final Filter bloomFilter;
+    public final IFilter bloomFilter;
 
-    private static final ColumnIndex EMPTY = new ColumnIndex(Collections.<IndexHelper.IndexInfo>emptyList(), FilterFactory.emptyFilter());
+    private static final ColumnIndex EMPTY = new ColumnIndex(Collections.<IndexHelper.IndexInfo>emptyList(), new AlwaysPresentFilter());
 
     private ColumnIndex(int estimatedColumnCount)
     {
-        this(new ArrayList<IndexHelper.IndexInfo>(), FilterFactory.getFilter(estimatedColumnCount, 4));
+        this(new ArrayList<IndexHelper.IndexInfo>(), FilterFactory.getFilter(estimatedColumnCount, 4, false));
     }
 
-    private ColumnIndex(List<IndexHelper.IndexInfo> columnsIndex, Filter bloomFilter)
+    private ColumnIndex(List<IndexHelper.IndexInfo> columnsIndex, IFilter bloomFilter)
     {
         this.columnsIndex = columnsIndex;
         this.bloomFilter = bloomFilter;
@@ -51,6 +52,8 @@ public class ColumnIndex
      */
     public static class Builder
     {
+        private static final OnDiskAtom.Serializer atomSerializer = Column.onDiskSerializer();
+
         private final ColumnIndex result;
         private final long indexOffset;
         private long startPosition = -1;
@@ -61,7 +64,6 @@ public class ColumnIndex
         private OnDiskAtom lastBlockClosing;
         private final DataOutput output;
         private final RangeTombstone.Tracker tombstoneTracker;
-        private final OnDiskAtom.Serializer atomSerializer;
         private int atomCount;
 
         public Builder(ColumnFamily cf,
@@ -72,7 +74,6 @@ public class ColumnIndex
             this.indexOffset = rowHeaderSize(key, cf.deletionInfo());
             this.result = new ColumnIndex(estimatedColumnCount);
             this.output = output;
-            this.atomSerializer = cf.getOnDiskSerializer();
             this.tombstoneTracker = new RangeTombstone.Tracker(cf.getComparator());
         }
 
@@ -105,7 +106,7 @@ public class ColumnIndex
          * Serializes the index into in-memory structure with all required components
          * such as Bloom Filter, index block size, IndexInfo list
          *
-         * @param columns Column family to create index for
+         * @param cf Column family to create index for
          *
          * @return information about index - it's Bloom Filter, block size and IndexInfo list
          */
@@ -115,7 +116,7 @@ public class ColumnIndex
             RangeTombstone tombstone = rangeIter.hasNext() ? rangeIter.next() : null;
             Comparator<ByteBuffer> comparator = cf.getComparator();
 
-            for (IColumn c : cf)
+            for (Column c : cf)
             {
                 while (tombstone != null && comparator.compare(c.name(), tombstone.min) >= 0)
                 {
@@ -145,7 +146,7 @@ public class ColumnIndex
         {
             atomCount++;
 
-            if (column instanceof IColumn)
+            if (column instanceof Column)
                 result.bloomFilter.add(column.name());
 
             if (firstColumn == null)

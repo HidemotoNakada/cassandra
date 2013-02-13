@@ -24,6 +24,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.cassandra.db.Table;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.dht.Token;
 
@@ -68,11 +69,10 @@ public class SimpleStrategy extends AbstractReplicationStrategy
 
     public void validateOptions() throws ConfigurationException
     {
-        if (configOptions == null || configOptions.get("replication_factor") == null)
-        {
+        validateExpectedOptions(Arrays.<String>asList("replication_factor"));
+        String rf = configOptions.get("replication_factor");
+        if (rf == null)
             throw new ConfigurationException("SimpleStrategy requires a replication_factor strategy option.");
-        }
-        warnOnUnexpectedOptions(Arrays.<String>asList("replication_factor"));
-        validateReplicationFactor(configOptions.get("replication_factor"));
+        validateReplicationFactor(rf);
     }
 }

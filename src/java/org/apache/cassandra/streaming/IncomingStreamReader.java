@@ -30,14 +30,16 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamily;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.ColumnSerializer;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Table;
 import org.apache.cassandra.db.compaction.CompactionController;
 import org.apache.cassandra.db.compaction.PrecompactedRow;
-import org.apache.cassandra.io.IColumnSerializer;
 import org.apache.cassandra.io.sstable.*;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.metrics.StreamingMetrics;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.OutboundTcpConnection;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.streaming.compress.CompressedInputStream;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -58,8 +60,21 @@ public class IncomingStreamReader
     public IncomingStreamReader(StreamHeader header, Socket socket) throws IOException
     {
         socket.setSoTimeout(DatabaseDescriptor.getStreamingSocketTimeout());
-        InetAddress host = header.broadcastAddress != null ? header.broadcastAddress
-                           : ((InetSocketAddress)socket.getRemoteSocketAddress()).getAddress();
+        InetAddress host = ((InetSocketAddress)socket.getRemoteSocketAddress()).getAddress();
+        if (header.pendingFiles.isEmpty() && header.file != null)
+        {
+            // StreamInSession should be created already when receiving 2nd and after files
+            if (!StreamInSession.hasSession(header.sessionId))
+            {
+                StreamReply reply = new StreamReply("", header.sessionId, StreamReply.Status.SESSION_FAILURE);
+                OutboundTcpConnection.write(reply.createMessage(),
+                                            header.sessionId.toString(),
+                                            System.currentTimeMillis(),
+                                            new DataOutputStream(socket.getOutputStream()),
+                                            MessagingService.instance().getVersion(host));
+                throw new IOException("Session " + header.sessionId + " already closed.");
+            }
+        }
         session = StreamInSession.get(host, header.sessionId);
         session.setSocket(socket);
 
@@ -82,7 +97,7 @@ public class IncomingStreamReader
         {
             underliningStream = null;
         }
-        metrics = StreamingMetrics.get(socket.getInetAddress());
+        metrics = StreamingMetrics.get(host);
     }
 
     /**
@@ -125,7 +140,7 @@ public class IncomingStreamReader
         ColumnFamilyStore cfs = Table.open(localFile.desc.ksname).getColumnFamilyStore(localFile.desc.cfname);
         DecoratedKey key;
         SSTableWriter writer = new SSTableWriter(localFile.getFilename(), remoteFile.estimatedKeys);
-        CompactionController controller = new CompactionController(cfs, Collections.<SSTableReader>emptyList(), Integer.MIN_VALUE, true);
+        CompactionController controller = new CompactionController(cfs, Collections.<SSTableReader>emptyList(), Integer.MIN_VALUE);
 
         try
         {
@@ -149,7 +164,7 @@ public class IncomingStreamReader
                     {
                         // need to update row cache
                         // Note: Because we won't just echo the columns, there is no need to use the PRESERVE_SIZE flag, contrarily to what appendFromStream does below
-                        SSTableIdentityIterator iter = new SSTableIdentityIterator(cfs.metadata, in, localFile.getFilename(), key, 0, dataSize, IColumnSerializer.Flag.FROM_REMOTE);
+                        SSTableIdentityIterator iter = new SSTableIdentityIterator(cfs.metadata, in, localFile.getFilename(), key, 0, dataSize, ColumnSerializer.Flag.FROM_REMOTE);
                         PrecompactedRow row = new PrecompactedRow(controller, Collections.singletonList(iter));
                         // We don't expire anything so the row shouldn't be empty
                         assert !row.isEmpty();
@@ -157,7 +172,7 @@ public class IncomingStreamReader
 
                         // update cache
                         ColumnFamily cf = row.getFullColumnFamily();
-                        cfs.updateRowCache(key, cf);
+                        cfs.maybeUpdateRowCache(key, cf);
                     }
                     else
                     {
@@ -166,10 +181,11 @@ public class IncomingStreamReader
                     }
 
                     bytesRead += in.getBytesRead();
-                    // when compressed, report total bytes of decompressed chunks since remoteFile.size is the sum of chunks transferred
-                    remoteFile.progress += remoteFile.compressionInfo != null
-                                           ? ((CompressedInputStream) underliningStream).uncompressedBytes()
-                                           : in.getBytesRead();
+                    // when compressed, report total bytes of compressed chunks read since remoteFile.size is the sum of chunks transferred
+                    if (remoteFile.compressionInfo != null)
+                        remoteFile.progress = ((CompressedInputStream) underliningStream).getTotalCompressedBytesRead();
+                    else
+                        remoteFile.progress += in.getBytesRead();
                     totalBytesRead += in.getBytesRead();
                 }
             }
@@ -184,6 +200,10 @@ public class IncomingStreamReader
                 throw (IOException) e;
             else
                 throw Throwables.propagate(e);
+        }
+        finally
+        {
+            controller.close();
         }
     }
 

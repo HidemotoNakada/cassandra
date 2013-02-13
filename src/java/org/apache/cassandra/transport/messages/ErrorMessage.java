@@ -18,7 +18,6 @@
 package org.apache.cassandra.transport.messages;
 
 import java.nio.ByteBuffer;
-import java.util.concurrent.TimeoutException;
 
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
@@ -26,12 +25,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.WriteType;
 import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.transport.CBUtil;
 import org.apache.cassandra.transport.Message;
 import org.apache.cassandra.transport.ProtocolException;
 import org.apache.cassandra.transport.ServerError;
-import org.apache.cassandra.thrift.AuthenticationException;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.MD5Digest;
 
@@ -58,9 +57,12 @@ public class ErrorMessage extends Message.Response
                 case PROTOCOL_ERROR:
                     te = new ProtocolException(msg);
                     break;
+                case BAD_CREDENTIALS:
+                    te = new AuthenticationException(msg);
+                    break;
                 case UNAVAILABLE:
                     {
-                        ConsistencyLevel cl = Enum.valueOf(ConsistencyLevel.class, CBUtil.readString(body));
+                        ConsistencyLevel cl = CBUtil.readConsistencyLevel(body);
                         int required = body.readInt();
                         int alive = body.readInt();
                         te = new UnavailableException(cl, required, alive);
@@ -76,18 +78,17 @@ public class ErrorMessage extends Message.Response
                     te = new TruncateException(msg);
                     break;
                 case WRITE_TIMEOUT:
-                    {
-                        ConsistencyLevel cl = Enum.valueOf(ConsistencyLevel.class, CBUtil.readString(body));
-                        int received = body.readInt();
-                        int blockFor = body.readInt();
-                        te = new WriteTimeoutException(cl, received, blockFor, false);
-                    }
-                    break;
                 case READ_TIMEOUT:
+                    ConsistencyLevel cl = CBUtil.readConsistencyLevel(body);
+                    int received = body.readInt();
+                    int blockFor = body.readInt();
+                    if (code == ExceptionCode.WRITE_TIMEOUT)
                     {
-                        ConsistencyLevel cl = Enum.valueOf(ConsistencyLevel.class, CBUtil.readString(body));
-                        int received = body.readInt();
-                        int blockFor = body.readInt();
+                        WriteType writeType = Enum.valueOf(WriteType.class, CBUtil.readString(body));
+                        te = new WriteTimeoutException(writeType, cl, received, blockFor);
+                    }
+                    else
+                    {
                         byte dataPresent = body.readByte();
                         te = new ReadTimeoutException(cl, received, blockFor, dataPresent != 0);
                     }
@@ -113,7 +114,10 @@ public class ErrorMessage extends Message.Response
                 case ALREADY_EXISTS:
                     String ksName = CBUtil.readString(body);
                     String cfName = CBUtil.readString(body);
-                    te = new AlreadyExistsException(ksName, cfName);
+                    if (cfName.isEmpty())
+                        te = new AlreadyExistsException(ksName);
+                    else
+                        te = new AlreadyExistsException(ksName, cfName);
                     break;
             }
             return new ErrorMessage(te);
@@ -129,10 +133,8 @@ public class ErrorMessage extends Message.Response
             {
                 case UNAVAILABLE:
                     UnavailableException ue = (UnavailableException)msg.error;
-                    ByteBuffer ueCl = ByteBufferUtil.bytes(ue.consistency.toString());
-
-                    acb = ChannelBuffers.buffer(2 + ueCl.remaining() + 8);
-                    acb.writeShort((short)ueCl.remaining());
+                    ChannelBuffer ueCl = CBUtil.consistencyLevelToCB(ue.consistency);
+                    acb = ChannelBuffers.buffer(ueCl.readableBytes() + 8);
                     acb.writeBytes(ueCl);
                     acb.writeInt(ue.required);
                     acb.writeInt(ue.alive);
@@ -140,17 +142,28 @@ public class ErrorMessage extends Message.Response
                 case WRITE_TIMEOUT:
                 case READ_TIMEOUT:
                     RequestTimeoutException rte = (RequestTimeoutException)msg.error;
-                    ReadTimeoutException readEx = rte instanceof ReadTimeoutException
-                                                ? (ReadTimeoutException)rte
-                                                : null;
-                    ByteBuffer rteCl = ByteBufferUtil.bytes(rte.consistency.toString());
-                    acb = ChannelBuffers.buffer(2 + rteCl.remaining() + 8 + (readEx == null ? 0 : 1));
-                    acb.writeShort((short)rteCl.remaining());
+                    boolean isWrite = msg.error.code() == ExceptionCode.WRITE_TIMEOUT;
+
+                    ChannelBuffer rteCl = CBUtil.consistencyLevelToCB(rte.consistency);
+                    ByteBuffer writeType = isWrite
+                                         ? ByteBufferUtil.bytes(((WriteTimeoutException)rte).writeType.toString())
+                                         : null;
+
+                    int extraSize = isWrite  ? 2 + writeType.remaining() : 1;
+                    acb = ChannelBuffers.buffer(rteCl.readableBytes() + 8 + extraSize);
+
                     acb.writeBytes(rteCl);
                     acb.writeInt(rte.received);
                     acb.writeInt(rte.blockFor);
-                    if (readEx != null)
-                        acb.writeByte((byte)(readEx.dataPresent ? 1 : 0));
+                    if (isWrite)
+                    {
+                        acb.writeShort((short)writeType.remaining());
+                        acb.writeBytes(writeType);
+                    }
+                    else
+                    {
+                        acb.writeByte((byte)(((ReadTimeoutException)rte).dataPresent ? 1 : 0));
+                    }
                     break;
                 case UNPREPARED:
                     PreparedQueryNotFoundException pqnfe = (PreparedQueryNotFoundException)msg.error;
@@ -181,7 +194,7 @@ public class ErrorMessage extends Message.Response
             return new ErrorMessage((TransportException)e);
 
         // Unexpected exception
-        logger.debug("Unexpected exception during request", e);
+        logger.error("Unexpected exception during request", e);
         return new ErrorMessage(new ServerError(e));
     }
 

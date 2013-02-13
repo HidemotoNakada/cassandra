@@ -17,27 +17,61 @@
  */
 package org.apache.cassandra.auth;
 
+import java.util.Collections;
 import java.util.Map;
+import java.util.Set;
 
+import org.apache.cassandra.exceptions.AuthenticationException;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.thrift.AuthenticationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 
 public class AllowAllAuthenticator implements IAuthenticator
 {
-    private final static AuthenticatedUser USER = new AuthenticatedUser("allow_all");
-
-    public AuthenticatedUser defaultUser()
+    public boolean requireAuthentication()
     {
-        return USER;
+        return false;
     }
 
-    public AuthenticatedUser authenticate(Map<? extends CharSequence,? extends CharSequence> credentials) throws AuthenticationException
+    public Set<Option> supportedOptions()
     {
-        return USER;
+        return Collections.emptySet();
+    }
+
+    public Set<Option> alterableOptions()
+    {
+        return Collections.emptySet();
+    }
+
+    public AuthenticatedUser authenticate(Map<String, String> credentials) throws AuthenticationException
+    {
+        return AuthenticatedUser.ANONYMOUS_USER;
+    }
+
+    public void create(String username, Map<Option, Object> options) throws InvalidRequestException
+    {
+        throw new InvalidRequestException("CREATE USER operation is not supported by AllowAllAuthenticator");
+    }
+
+    public void alter(String username, Map<Option, Object> options) throws InvalidRequestException
+    {
+        throw new InvalidRequestException("ALTER USER operation is not supported by AllowAllAuthenticator");
+    }
+
+    public void drop(String username) throws InvalidRequestException
+    {
+        throw new InvalidRequestException("DROP USER operation is not supported by AllowAllAuthenticator");
+    }
+
+    public Set<IResource> protectedResources()
+    {
+        return Collections.emptySet();
     }
 
     public void validateConfiguration() throws ConfigurationException
     {
-        // pass
+    }
+
+    public void setup()
+    {
     }
 }

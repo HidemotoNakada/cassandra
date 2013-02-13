@@ -18,9 +18,7 @@
 package org.apache.cassandra.io.sstable;
 
 import java.io.*;
-import java.nio.channels.ClosedChannelException;
 import java.util.*;
-import java.util.regex.Pattern;
 
 import com.google.common.collect.Sets;
 import org.slf4j.Logger;
@@ -33,7 +31,6 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.*;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.io.FSWriteError;
-import org.apache.cassandra.io.IColumnSerializer;
 import org.apache.cassandra.io.compress.CompressedSequentialWriter;
 import org.apache.cassandra.io.util.*;
 import org.apache.cassandra.service.StorageService;
@@ -49,7 +46,7 @@ public class SSTableWriter extends SSTable
     private DecoratedKey lastWrittenKey;
     private FileMark dataMark;
     private final SSTableMetadata.Collector sstableMetadataCollector;
-    private final TypeSizes typeSizes = TypeSizes.NATIVE;
+    private DataIntegrityMetadata.ChecksumWriter integratyWriter;
 
     public SSTableWriter(String filename, long keyCount)
     {
@@ -63,17 +60,25 @@ public class SSTableWriter extends SSTable
     private static Set<Component> components(CFMetaData metadata)
     {
         Set<Component> components = new HashSet<Component>(Arrays.asList(Component.DATA,
-                                                                         Component.FILTER,
                                                                          Component.PRIMARY_INDEX,
                                                                          Component.STATS,
-                                                                         Component.SUMMARY));
+                                                                         Component.SUMMARY,
+                                                                         Component.TOC));
+
+        if (metadata.getBloomFilterFpChance() < 1.0)
+            components.add(Component.FILTER);
 
         if (metadata.compressionParameters().sstableCompressor != null)
+        {
             components.add(Component.COMPRESSION_INFO);
+        }
         else
+        {
             // it would feel safer to actually add this component later in maybeWriteDigest(),
             // but the components are unmodifiable after construction
             components.add(Component.DIGEST);
+            components.add(Component.CRC);
+        }
         return components;
     }
 
@@ -94,16 +99,17 @@ public class SSTableWriter extends SSTable
             dbuilder = SegmentedFile.getCompressedBuilder();
             dataFile = CompressedSequentialWriter.open(getFilename(),
                                                        descriptor.filenameFor(Component.COMPRESSION_INFO),
-                                                       !DatabaseDescriptor.populateIOCacheOnFlush(),
+                                                       !metadata.populateIoCacheOnFlush(),
                                                        metadata.compressionParameters(),
                                                        sstableMetadataCollector);
         }
         else
         {
             dbuilder = SegmentedFile.getBuilder(DatabaseDescriptor.getDiskAccessMode());
-            dataFile = SequentialWriter.open(new File(getFilename()), 
-			                      !DatabaseDescriptor.populateIOCacheOnFlush());
-            dataFile.setComputeDigest();
+            dataFile = SequentialWriter.open(new File(getFilename()),
+			                      !metadata.populateIoCacheOnFlush());
+            integratyWriter = DataIntegrityMetadata.checksumWriter(descriptor);
+            dataFile.setDataIntegratyWriter(integratyWriter);
         }
 
         this.sstableMetadataCollector = sstableMetadataCollector;
@@ -126,7 +132,7 @@ public class SSTableWriter extends SSTable
      */
     private long beforeAppend(DecoratedKey decoratedKey)
     {
-        assert decoratedKey != null : "Keys must not be null";
+        assert decoratedKey != null : "Keys must not be null"; // empty keys ARE allowed b/c of indexed column values
         if (lastWrittenKey != null && lastWrittenKey.compareTo(decoratedKey) >= 0)
             throw new RuntimeException("Last written key " + lastWrittenKey + " >= current key " + decoratedKey + " writing into " + getFilename());
         return (lastWrittenKey == null) ? 0 : dataFile.getFilePointer();
@@ -232,40 +238,28 @@ public class SSTableWriter extends SSTable
         }
 
         // deserialize each column to obtain maxTimestamp and immediately serialize it.
+        long minTimestamp = Long.MAX_VALUE;
         long maxTimestamp = Long.MIN_VALUE;
         StreamingHistogram tombstones = new StreamingHistogram(TOMBSTONE_HISTOGRAM_BIN_SIZE);
         ColumnFamily cf = ColumnFamily.create(metadata, ArrayBackedSortedColumns.factory());
         cf.delete(deletionInfo);
 
         ColumnIndex.Builder columnIndexer = new ColumnIndex.Builder(cf, key.key, columnCount, dataFile.stream);
-        OnDiskAtom.Serializer atomSerializer = cf.getOnDiskSerializer();
+        OnDiskAtom.Serializer atomSerializer = Column.onDiskSerializer();
         for (int i = 0; i < columnCount; i++)
         {
             // deserialize column with PRESERVE_SIZE because we've written the dataSize based on the
             // data size received, so we must reserialize the exact same data
-            OnDiskAtom atom = atomSerializer.deserializeFromSSTable(in, IColumnSerializer.Flag.PRESERVE_SIZE, Integer.MIN_VALUE, Descriptor.Version.CURRENT);
+            OnDiskAtom atom = atomSerializer.deserializeFromSSTable(in, ColumnSerializer.Flag.PRESERVE_SIZE, Integer.MIN_VALUE, Descriptor.Version.CURRENT);
             if (atom instanceof CounterColumn)
-            {
                 atom = ((CounterColumn) atom).markDeltaToBeCleared();
-            }
-            else if (atom instanceof SuperColumn)
-            {
-                SuperColumn sc = (SuperColumn) atom;
-                for (IColumn subColumn : sc.getSubColumns())
-                {
-                    if (subColumn instanceof CounterColumn)
-                    {
-                        IColumn marked = ((CounterColumn) subColumn).markDeltaToBeCleared();
-                        sc.replace(subColumn, marked);
-                    }
-                }
-            }
 
             int deletionTime = atom.getLocalDeletionTime();
             if (deletionTime < Integer.MAX_VALUE)
             {
                 tombstones.update(deletionTime);
             }
+            minTimestamp = Math.min(minTimestamp, atom.minTimestamp());
             maxTimestamp = Math.max(maxTimestamp, atom.maxTimestamp());
             try
             {
@@ -279,6 +273,7 @@ public class SSTableWriter extends SSTable
 
         assert dataSize == dataFile.getFilePointer() - (dataStart + 8)
                 : "incorrect row data size " + dataSize + " written to " + dataFile.getPath() + "; correct is " + (dataFile.getFilePointer() - (dataStart + 8));
+        sstableMetadataCollector.updateMinTimestamp(minTimestamp);
         sstableMetadataCollector.updateMaxTimestamp(maxTimestamp);
         sstableMetadataCollector.addRowSize(dataFile.getFilePointer() - currentPosition);
         sstableMetadataCollector.addColumnCount(columnCount);
@@ -323,7 +318,9 @@ public class SSTableWriter extends SSTable
         // write sstable statistics
         SSTableMetadata sstableMetadata = sstableMetadataCollector.finalizeMetadata(partitioner.getClass().getCanonicalName());
         writeMetadata(descriptor, sstableMetadata);
-        maybeWriteDigest();
+
+        // save the table of components
+        SSTable.appendTOC(descriptor, components);
 
         // remove the 'tmp' marker from all components
         final Descriptor newdesc = rename(descriptor, components);
@@ -348,28 +345,6 @@ public class SSTableWriter extends SSTable
         iwriter = null;
         dbuilder = null;
         return sstable;
-    }
-
-    private void maybeWriteDigest()
-    {
-        byte[] digest = dataFile.digest();
-        if (digest == null)
-            return;
-
-        SequentialWriter out = SequentialWriter.open(new File(descriptor.filenameFor(SSTable.COMPONENT_DIGEST)), true);
-        // Writting output compatible with sha1sum
-        Descriptor newdesc = descriptor.asTemporary(false);
-        String[] tmp = newdesc.filenameFor(SSTable.COMPONENT_DATA).split(Pattern.quote(File.separator));
-        String dataFileName = tmp[tmp.length - 1];
-        try
-        {
-            out.write(String.format("%s  %s", Hex.bytesToHex(digest), dataFileName).getBytes());
-        }
-        catch (ClosedChannelException e)
-        {
-            throw new AssertionError(); // can't happen.
-        }
-        out.close();
     }
 
     private static void writeMetadata(Descriptor desc, SSTableMetadata sstableMetadata)
@@ -425,25 +400,16 @@ public class SSTableWriter extends SSTable
         private final SequentialWriter indexFile;
         public final SegmentedFile.Builder builder;
         public final IndexSummary summary;
-        public final Filter bf;
+        public final IFilter bf;
         private FileMark mark;
 
         IndexWriter(long keyCount)
         {
             indexFile = SequentialWriter.open(new File(descriptor.filenameFor(SSTable.COMPONENT_INDEX)),
-                                              !DatabaseDescriptor.populateIOCacheOnFlush());
+                                              !metadata.populateIoCacheOnFlush());
             builder = SegmentedFile.getBuilder(DatabaseDescriptor.getIndexAccessMode());
-            summary = new IndexSummary(keyCount);
-
-            Double fpChance = metadata.getBloomFilterFpChance();
-            if (fpChance != null && fpChance == 0)
-            {
-                // paranoia -- we've had bugs in the thrift <-> avro <-> CfDef dance before, let's not let that break things
-                logger.error("Bloom filter FP chance of zero isn't supposed to happen");
-                fpChance = null;
-            }
-            bf = fpChance == null ? FilterFactory.getFilter(keyCount, 15)
-                                  : FilterFactory.getFilter(keyCount, fpChance);
+            summary = new IndexSummary(keyCount, metadata.getIndexInterval());
+            bf = FilterFactory.getFilter(keyCount, metadata.getBloomFilterFpChance(), true);
         }
 
         public void append(DecoratedKey key, RowIndexEntry indexEntry)
@@ -472,20 +438,23 @@ public class SSTableWriter extends SSTable
          */
         public void close()
         {
-            String path = descriptor.filenameFor(SSTable.COMPONENT_FILTER);
-            try
+            if (components.contains(Component.FILTER))
             {
-                // bloom filter
-                FileOutputStream fos = new FileOutputStream(path);
-                DataOutputStream stream = new DataOutputStream(fos);
-                FilterFactory.serialize(bf, stream, descriptor.version.filterType);
-                stream.flush();
-                fos.getFD().sync();
-                stream.close();
-            }
-            catch (IOException e)
-            {
-                throw new FSWriteError(e, path);
+                String path = descriptor.filenameFor(SSTable.COMPONENT_FILTER);
+                try
+                {
+                    // bloom filter
+                    FileOutputStream fos = new FileOutputStream(path);
+                    DataOutputStream stream = new DataOutputStream(fos);
+                    FilterFactory.serialize(bf, stream, descriptor.version.filterType);
+                    stream.flush();
+                    fos.getFD().sync();
+                    stream.close();
+                }
+                catch (IOException e)
+                {
+                    throw new FSWriteError(e, path);
+                }
             }
 
             // index

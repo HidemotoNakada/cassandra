@@ -17,14 +17,13 @@
  */
 package org.apache.cassandra.db.marshal;
 
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.db.IColumn;
+import org.apache.cassandra.db.Column;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 
 public class SetType<T> extends CollectionType<Set<T>>
@@ -43,12 +42,12 @@ public class SetType<T> extends CollectionType<Set<T>>
         return getInstance(l.get(0));
     }
 
-    public static synchronized <T> SetType getInstance(AbstractType<T> elements)
+    public static synchronized <T> SetType<T> getInstance(AbstractType<T> elements)
     {
-        SetType t = instances.get(elements);
+        SetType<T> t = instances.get(elements);
         if (t == null)
         {
-            t = new SetType(elements);
+            t = new SetType<T>(elements);
             instances.put(elements, t);
         }
         return t;
@@ -72,17 +71,26 @@ public class SetType<T> extends CollectionType<Set<T>>
 
     public Set<T> compose(ByteBuffer bytes)
     {
-        ByteBuffer input = bytes.duplicate();
-        int n = input.getShort();
-        Set<T> l = new LinkedHashSet<T>(n);
-        for (int i = 0; i < n; i++)
+        try
         {
-            int s = input.getShort();
-            byte[] data = new byte[s];
-            input.get(data);
-            l.add(elements.compose(ByteBuffer.wrap(data)));
+            ByteBuffer input = bytes.duplicate();
+            int n = input.getShort();
+            Set<T> l = new LinkedHashSet<T>(n);
+            for (int i = 0; i < n; i++)
+            {
+                int s = input.getShort();
+                byte[] data = new byte[s];
+                input.get(data);
+                ByteBuffer databb = ByteBuffer.wrap(data);
+                elements.validate(databb);
+                l.add(elements.compose(databb));
+            }
+            return l;
         }
-        return l;
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a set");
+        }
     }
 
     /**
@@ -110,11 +118,11 @@ public class SetType<T> extends CollectionType<Set<T>>
         sb.append(getClass().getName()).append(TypeParser.stringifyTypeParameters(Collections.<AbstractType<?>>singletonList(elements)));
     }
 
-    public ByteBuffer serialize(List<Pair<ByteBuffer, IColumn>> columns)
+    public ByteBuffer serialize(List<Pair<ByteBuffer, Column>> columns)
     {
         List<ByteBuffer> bbs = new ArrayList<ByteBuffer>(columns.size());
         int size = 0;
-        for (Pair<ByteBuffer, IColumn> p : columns)
+        for (Pair<ByteBuffer, Column> p : columns)
         {
             bbs.add(p.left);
             size += 2 + p.left.remaining();

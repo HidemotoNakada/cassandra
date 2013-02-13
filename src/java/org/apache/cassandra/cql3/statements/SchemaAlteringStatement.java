@@ -19,31 +19,20 @@ package org.apache.cassandra.cql3.statements;
 
 import java.nio.ByteBuffer;
 import java.util.List;
-import java.util.Map;
 
-import org.apache.cassandra.cql3.CQLStatement;
-import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.transport.messages.ResultMessage;
-import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.CFName;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.exceptions.RequestValidationException;
-import org.apache.cassandra.exceptions.UnauthorizedException;
+import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.exceptions.*;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.StorageProxy;
-
-import com.google.common.base.Predicates;
-import com.google.common.collect.Maps;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.messages.ResultMessage;
 
 /**
  * Abstract class for statements that alter the schema.
  */
 public abstract class SchemaAlteringStatement extends CFStatement implements CQLStatement
 {
-    private static final long timeLimitForSchemaAgreement = 10 * 1000;
-
     private final boolean isColumnFamilyLevel;
 
     protected SchemaAlteringStatement()
@@ -65,10 +54,13 @@ public abstract class SchemaAlteringStatement extends CFStatement implements CQL
             super.prepareKeyspace(state);
     }
 
-    public Prepared prepare() throws InvalidRequestException
+    @Override
+    public Prepared prepare()
     {
         return new Prepared(this);
     }
+
+    public abstract ResultMessage.SchemaChange.Change changeType();
 
     public abstract void announceMigration() throws RequestValidationException;
 
@@ -76,18 +68,16 @@ public abstract class SchemaAlteringStatement extends CFStatement implements CQL
     public void validate(ClientState state) throws RequestValidationException
     {}
 
-    public ResultMessage execute(ClientState state, List<ByteBuffer> variables) throws RequestValidationException
+    public ResultMessage execute(ConsistencyLevel cl, QueryState state, List<ByteBuffer> variables) throws RequestValidationException
     {
-        try
-        {
-            announceMigration();
-        }
-        catch (ConfigurationException e)
-        {
-            InvalidRequestException ex = new InvalidRequestException(e.toString());
-            ex.initCause(e);
-            throw ex;
-        }
-        return null;
+        announceMigration();
+        String tableName = cfName == null || columnFamily() == null ? "" : columnFamily();
+        return new ResultMessage.SchemaChange(changeType(), keyspace(), tableName);
+    }
+
+    public ResultMessage executeInternal(QueryState state)
+    {
+        // executeInternal is for local query only, thus altering schema is not supported
+        throw new UnsupportedOperationException();
     }
 }

@@ -1,4 +1,3 @@
-
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -50,6 +49,18 @@ commands:
   - name: compactionstats
     help: |
       Print statistics on compactions
+  - name: disablehandoff
+    help: |
+      Disable the future hints storing on the current node
+  - name: enablehandoff
+    help: |
+      Reenable the future hints storing on the current node
+  - name: resumehandoff
+    help: |
+      Resume hints delivery process
+  - name: pausehandoff
+    help: |
+      Pause hints delivery process
   - name: disablegossip
     help: |
       Disable gossip (effectively marking the node dead)
@@ -82,7 +93,7 @@ commands:
       Print network information on provided host (connecting node by default)
   - name: move <new token>
     help: |
-      Move node on the token ring to a new token
+      Move node on the token ring to a new token. (for -ve tokens, use \\ to escape, Example: move \\-123)
   - name: removenode status|force|<ID>
     help: |
       Show status of current node removal, force completion of pending removal or remove provided ID
@@ -128,6 +139,9 @@ commands:
   - name: upgradesstables [keyspace] [cfnames]
     help: |
       Scrub (rebuild sstables for) one or more column families
+  - name: setcompactionthreshold <keyspace> <cfname>
+    help: |
+      Set min and max compaction thresholds for a given column family
   - name: getcompactionthreshold <keyspace> <cfname>
     help: |
       Print min and max compaction thresholds for a given column family
@@ -149,4 +163,6 @@ commands:
   - name: getsstables <keyspace> <cf> <key>
     help: |
       Print the sstable filenames that own the key
-
+  - name: predictconsistency <replication_factor> <time> [versions] [latency_percentile]
+    help: |
+      Predict latency and consistency "t" ms after writes

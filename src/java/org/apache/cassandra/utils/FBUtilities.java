@@ -22,6 +22,8 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.math.BigInteger;
 import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.net.URL;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
@@ -32,6 +34,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.zip.Checksum;
 
 import com.google.common.base.Joiner;
 import com.google.common.collect.AbstractIterator;
@@ -49,6 +52,7 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.io.util.IAllocator;
 import org.apache.cassandra.net.IAsyncResult;
 import org.apache.thrift.TBase;
 import org.apache.thrift.TDeserializer;
@@ -67,6 +71,14 @@ public class FBUtilities
 
     private static volatile InetAddress localInetAddress;
     private static volatile InetAddress broadcastInetAddress;
+
+    public static int getAvailableProcessors()
+    {
+        if (System.getProperty("cassandra.available_processors") != null)
+            return Integer.parseInt(System.getProperty("cassandra.available_processors"));
+        else
+            return Runtime.getRuntime().availableProcessors();
+    }
 
     private static final ThreadLocal<MessageDigest> localMD5Digest = new ThreadLocal<MessageDigest>()
     {
@@ -144,6 +156,25 @@ public class FBUtilities
                                  ? getLocalAddress()
                                  : DatabaseDescriptor.getBroadcastAddress();
         return broadcastInetAddress;
+    }
+
+    public static Collection<InetAddress> getAllLocalAddresses()
+    {
+        Set<InetAddress> localAddresses = new HashSet<InetAddress>();
+        try
+        {
+            Enumeration<NetworkInterface> nets = NetworkInterface.getNetworkInterfaces();
+            if (nets != null)
+            {
+                while (nets.hasMoreElements())
+                    localAddresses.addAll(Collections.list(nets.nextElement().getInetAddresses()));
+            }
+        }
+        catch (SocketException e)
+        {
+            throw new AssertionError(e);
+        }
+        return localAddresses;
     }
 
     /**
@@ -392,6 +423,13 @@ public class FBUtilities
         return FBUtilities.construct(partitionerClassName, "partitioner");
     }
 
+    public static IAllocator newOffHeapAllocator(String offheap_allocator) throws ConfigurationException
+    {
+        if (!offheap_allocator.contains("."))
+            offheap_allocator = "org.apache.cassandra.io.util." + offheap_allocator;
+        return FBUtilities.construct(offheap_allocator, "off-heap allocator");
+    }
+
     /**
      * @return The Class for the given name.
      * @param classname Fully qualified classname.
@@ -405,6 +443,10 @@ public class FBUtilities
             return (Class<T>)Class.forName(classname);
         }
         catch (ClassNotFoundException e)
+        {
+            throw new ConfigurationException(String.format("Unable to find %s class '%s'", readable, classname));
+        }
+        catch (NoClassDefFoundError e)
         {
             throw new ConfigurationException(String.format("Unable to find %s class '%s'", readable, classname));
         }
@@ -566,6 +608,14 @@ public class FBUtilities
         {
             throw new AssertionError();
         }
+    }
+
+    public static void updateChecksumInt(Checksum checksum, int v)
+    {
+        checksum.update((v >>> 24) & 0xFF);
+        checksum.update((v >>> 16) & 0xFF);
+        checksum.update((v >>> 8) & 0xFF);
+        checksum.update((v >>> 0) & 0xFF);
     }
 
     private static final class WrappedCloseableIterator<T>

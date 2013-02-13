@@ -22,13 +22,12 @@ import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 
+import org.apache.cassandra.io.ISerializer;
 import org.apache.cassandra.io.FSReadError;
-import org.apache.cassandra.io.IColumnSerializer;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 
-public class ColumnSerializer implements IColumnSerializer
+public class ColumnSerializer implements ISerializer<Column>
 {
     public final static int DELETION_MASK        = 0x01;
     public final static int EXPIRATION_MASK      = 0x02;
@@ -36,7 +35,23 @@ public class ColumnSerializer implements IColumnSerializer
     public final static int COUNTER_UPDATE_MASK  = 0x08;
     public final static int RANGE_TOMBSTONE_MASK = 0x10;
 
-    public void serialize(IColumn column, DataOutput dos) throws IOException
+    /**
+     * Flag affecting deserialization behavior.
+     *  - LOCAL: for deserialization of local data (Expired columns are
+     *      converted to tombstones (to gain disk space)).
+     *  - FROM_REMOTE: for deserialization of data received from remote hosts
+     *      (Expired columns are converted to tombstone and counters have
+     *      their delta cleared)
+     *  - PRESERVE_SIZE: used when no transformation must be performed, i.e,
+     *      when we must ensure that deserializing and reserializing the
+     *      result yield the exact same bytes. Streaming uses this.
+     */
+    public static enum Flag
+    {
+        LOCAL, FROM_REMOTE, PRESERVE_SIZE;
+    }
+
+    public void serialize(Column column, DataOutput dos) throws IOException
     {
         assert column.name().remaining() > 0;
         ByteBufferUtil.writeWithShortLength(column.name(), dos);
@@ -71,12 +86,12 @@ public class ColumnSerializer implements IColumnSerializer
      * deserialize comes from a remote host. If it does, then we must clear
      * the delta.
      */
-    public Column deserialize(DataInput dis, IColumnSerializer.Flag flag) throws IOException
+    public Column deserialize(DataInput dis, ColumnSerializer.Flag flag) throws IOException
     {
         return deserialize(dis, flag, (int) (System.currentTimeMillis() / 1000));
     }
 
-    public Column deserialize(DataInput dis, IColumnSerializer.Flag flag, int expireBefore) throws IOException
+    public Column deserialize(DataInput dis, ColumnSerializer.Flag flag, int expireBefore) throws IOException
     {
         ByteBuffer name = ByteBufferUtil.readWithShortLength(dis);
         if (name.remaining() <= 0)
@@ -86,7 +101,7 @@ public class ColumnSerializer implements IColumnSerializer
         return deserializeColumnBody(dis, name, b, flag, expireBefore);
     }
 
-    Column deserializeColumnBody(DataInput dis, ByteBuffer name, int mask, IColumnSerializer.Flag flag, int expireBefore) throws IOException
+    Column deserializeColumnBody(DataInput dis, ByteBuffer name, int mask, ColumnSerializer.Flag flag, int expireBefore) throws IOException
     {
         if ((mask & COUNTER_MASK) != 0)
         {
@@ -106,11 +121,6 @@ public class ColumnSerializer implements IColumnSerializer
         else
         {
             long ts = dis.readLong();
-            long now = FBUtilities.timestampMicros();
-
-            if (ts > now) // fixing the timestamp from the future to be 'now' in micros
-                ts = now; // helps with CASSANDRA-4561 as remote nodes can send schema with wrong nanoTime() timestamps
-
             ByteBuffer value = ByteBufferUtil.readWithLength(dis);
             return (mask & COUNTER_UPDATE_MASK) != 0
                    ? new CounterUpdateColumn(name, value, ts)
@@ -120,7 +130,7 @@ public class ColumnSerializer implements IColumnSerializer
         }
     }
 
-    public long serializedSize(IColumn column, TypeSizes type)
+    public long serializedSize(Column column, TypeSizes type)
     {
         return column.serializedSize(type);
     }

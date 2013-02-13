@@ -26,10 +26,14 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
 import org.jboss.netty.util.CharsetUtil;
+
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.utils.UUIDGen;
 
 /**
  * ChannelBuffer utility methods.
@@ -131,6 +135,46 @@ public abstract class CBUtil
         }
     }
 
+    public static ChannelBuffer consistencyLevelToCB(ConsistencyLevel consistency)
+    {
+        return shortToCB(consistency.code);
+    }
+
+    public static ConsistencyLevel readConsistencyLevel(ChannelBuffer cb)
+    {
+        return ConsistencyLevel.fromCode(cb.readUnsignedShort());
+    }
+
+    public static <T extends Enum<T>> T readEnumValue(Class<T> enumType, ChannelBuffer cb)
+    {
+        String value = CBUtil.readString(cb);
+        try
+        {
+            return Enum.valueOf(enumType, value.toUpperCase());
+        }
+        catch (IllegalArgumentException e)
+        {
+            throw new ProtocolException(String.format("Invalid value '%s' for %s", value, enumType.getSimpleName()));
+        }
+    }
+
+    public static <T extends Enum<T>> ChannelBuffer enumValueToCB(T enumValue)
+    {
+        return stringToCB(enumValue.toString());
+    }
+
+    public static ChannelBuffer uuidToCB(UUID uuid)
+    {
+        return ChannelBuffers.wrappedBuffer(UUIDGen.decompose(uuid));
+    }
+
+    public static UUID readUuid(ChannelBuffer cb)
+    {
+        byte[] bytes = new byte[16];
+        cb.readBytes(bytes);
+        return UUIDGen.getUUID(ByteBuffer.wrap(bytes));
+    }
+
     public static ChannelBuffer longStringToCB(String str)
     {
         ChannelBuffer bytes = bytes(str);
@@ -140,7 +184,7 @@ public abstract class CBUtil
     public static List<String> readStringList(ChannelBuffer cb)
     {
         int length = cb.readUnsignedShort();
-        List<String> l = new ArrayList<String>();
+        List<String> l = new ArrayList<String>(length);
         for (int i = 0; i < length; i++)
             l.add(readString(cb));
         return l;

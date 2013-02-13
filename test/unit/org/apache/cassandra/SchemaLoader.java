@@ -33,7 +33,7 @@ import org.apache.cassandra.config.*;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.compaction.LeveledCompactionStrategy;
-import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.db.filter.QueryFilter;
 import org.apache.cassandra.db.index.composites.CompositesIndex;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -149,7 +149,9 @@ public class SchemaLoader
             null,
             null));
 
-        // Make it easy to test leveled compaction
+        // Make it easy to test compaction
+        Map<String, String> compactionOptions = new HashMap<String, String>();
+        compactionOptions.put("tombstone_compaction_interval", "1");
         Map<String, String> leveledOptions = new HashMap<String, String>();
         leveledOptions.put("sstable_size_in_mb", "1");
 
@@ -159,7 +161,7 @@ public class SchemaLoader
                                            opts_rf1,
 
                                            // Column Families
-                                           standardCFMD(ks1, "Standard1", withOldCfIds),
+                                           standardCFMD(ks1, "Standard1", withOldCfIds).compactionStrategyOptions(compactionOptions),
                                            standardCFMD(ks1, "Standard2", withOldCfIds),
                                            standardCFMD(ks1, "Standard3", withOldCfIds),
                                            standardCFMD(ks1, "Standard4", withOldCfIds),
@@ -409,9 +411,7 @@ public class SchemaLoader
         {
             ByteBuffer key = ByteBufferUtil.bytes("key" + i);
             RowMutation rowMutation = new RowMutation(keyspace, key);
-            QueryPath path = new QueryPath(columnFamily, null, ByteBufferUtil.bytes("col" + i));
-
-            rowMutation.add(path, ByteBufferUtil.bytes("val" + i), System.currentTimeMillis());
+            rowMutation.add(columnFamily, ByteBufferUtil.bytes("col" + i), ByteBufferUtil.bytes("val" + i), System.currentTimeMillis());
             rowMutation.applyUnsafe();
         }
     }
@@ -423,9 +423,7 @@ public class SchemaLoader
         for (int i = offset; i < offset + numberOfRows; i++)
         {
             DecoratedKey key = Util.dk("key" + i);
-            QueryPath path = new QueryPath(columnFamily, null, ByteBufferUtil.bytes("col" + i));
-
-            store.getColumnFamily(key, path, ByteBufferUtil.EMPTY_BYTE_BUFFER, ByteBufferUtil.EMPTY_BYTE_BUFFER, false, 1);
+            store.getColumnFamily(QueryFilter.getNamesFilter(key, columnFamily, ByteBufferUtil.bytes("col" + i)));
         }
     }
 

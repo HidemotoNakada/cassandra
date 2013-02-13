@@ -23,6 +23,7 @@ import java.util.List;
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
 
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.*;
 
 public class RegisterMessage extends Message.Request
@@ -31,20 +32,19 @@ public class RegisterMessage extends Message.Request
     {
         public RegisterMessage decode(ChannelBuffer body)
         {
-            List<String> l = CBUtil.readStringList(body);
-            List<Event.Type> eventTypes = new ArrayList<Event.Type>(l.size());
-            for (String s : l)
-                eventTypes.add(Enum.valueOf(Event.Type.class, s.toUpperCase()));
+            int length = body.readUnsignedShort();
+            List<Event.Type> eventTypes = new ArrayList<Event.Type>(length);
+            for (int i = 0; i < length; ++i)
+                eventTypes.add(CBUtil.readEnumValue(Event.Type.class, body));
             return new RegisterMessage(eventTypes);
         }
 
         public ChannelBuffer encode(RegisterMessage msg)
         {
-            List<String> l = new ArrayList<String>(msg.eventTypes.size());
-            for (Event.Type type : msg.eventTypes)
-                l.add(type.toString());
             ChannelBuffer cb = ChannelBuffers.dynamicBuffer();
-            CBUtil.writeStringList(cb, l);
+            cb.writeShort(msg.eventTypes.size());
+            for (Event.Type type : msg.eventTypes)
+                cb.writeBytes(CBUtil.enumValueToCB(type));
             return cb;
         }
     };
@@ -57,7 +57,7 @@ public class RegisterMessage extends Message.Request
         this.eventTypes = eventTypes;
     }
 
-    public Response execute()
+    public Response execute(QueryState state)
     {
         assert connection instanceof ServerConnection;
         Connection.Tracker tracker = ((ServerConnection)connection).getTracker();

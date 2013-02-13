@@ -23,6 +23,7 @@ import java.util.*;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.index.AbstractSimplePerColumnSecondaryIndex;
 import org.apache.cassandra.db.index.PerColumnSecondaryIndex;
 import org.apache.cassandra.db.index.SecondaryIndex;
 import org.apache.cassandra.db.index.SecondaryIndexManager;
@@ -77,10 +78,10 @@ public class CompositesSearcher extends SecondaryIndexSearcher
     }
 
     @Override
-    public List<Row> search(List<IndexExpression> clause, AbstractBounds<RowPosition> range, int maxResults, IFilter dataFilter, boolean maxIsColumns)
+    public List<Row> search(List<IndexExpression> clause, AbstractBounds<RowPosition> range, int maxResults, IDiskAtomFilter dataFilter, boolean countCQL3Rows)
     {
         assert clause != null && !clause.isEmpty();
-        ExtendedFilter filter = ExtendedFilter.create(baseCfs, dataFilter, clause, maxResults, maxIsColumns, false);
+        ExtendedFilter filter = ExtendedFilter.create(baseCfs, dataFilter, clause, maxResults, countCQL3Rows, false);
         return baseCfs.filter(getIndexedIterator(range, filter), filter);
     }
 
@@ -93,6 +94,10 @@ public class CompositesSearcher extends SecondaryIndexSearcher
         final SecondaryIndex index = indexManager.getIndexForColumn(primary.column_name);
         assert index != null;
         final DecoratedKey indexKey = index.getIndexKeyFor(primary.value);
+
+        if (logger.isDebugEnabled())
+            logger.debug("Most-selective indexed predicate is {}",
+                         ((AbstractSimplePerColumnSecondaryIndex) index).expressionString(primary));
 
         /*
          * XXX: If the range requested is a token range, we'll have to start at the beginning (and stop at the end) of
@@ -155,8 +160,7 @@ public class CompositesSearcher extends SecondaryIndexSearcher
         return new ColumnFamilyStore.AbstractScanIterator()
         {
             private ByteBuffer lastSeenPrefix = startPrefix;
-            private Deque<IColumn> indexColumns;
-            private final QueryPath path = new QueryPath(baseCfs.columnFamily);
+            private Deque<Column> indexColumns;
             private int columnsRead = Integer.MAX_VALUE;
 
             private final int meanColumns = Math.max(index.getIndexCfs().getMeanColumns(), 1);
@@ -204,17 +208,16 @@ public class CompositesSearcher extends SecondaryIndexSearcher
                     {
                         if (columnsRead < rowsPerQuery)
                         {
-                            logger.debug("Read only {} (< {}) last page through, must be done", columnsRead, rowsPerQuery);
+                            logger.trace("Read only {} (< {}) last page through, must be done", columnsRead, rowsPerQuery);
                             return makeReturn(currentKey, data);
                         }
 
-                        // TODO: broken because we need to extract the component comparator rather than the whole name comparator
-                        // if (logger.isDebugEnabled())
-                        //     logger.debug("Scanning index {} starting with {}",
-                        //                  expressionString(primary), indexComparator.getString(startPrefix));
+                        if (logger.isTraceEnabled())
+                            logger.trace("Scanning index {} starting with {}",
+                                         ((AbstractSimplePerColumnSecondaryIndex)index).expressionString(primary), indexComparator.getString(startPrefix));
 
                         QueryFilter indexFilter = QueryFilter.getSliceFilter(indexKey,
-                                                                             new QueryPath(index.getIndexCfs().getColumnFamilyName()),
+                                                                             index.getIndexCfs().name,
                                                                              lastSeenPrefix,
                                                                              endPrefix,
                                                                              false,
@@ -223,33 +226,33 @@ public class CompositesSearcher extends SecondaryIndexSearcher
                         if (indexRow == null)
                             return makeReturn(currentKey, data);
 
-                        Collection<IColumn> sortedColumns = indexRow.getSortedColumns();
+                        Collection<Column> sortedColumns = indexRow.getSortedColumns();
                         columnsRead = sortedColumns.size();
                         indexColumns = new ArrayDeque(sortedColumns);
-                        IColumn firstColumn = sortedColumns.iterator().next();
+                        Column firstColumn = sortedColumns.iterator().next();
 
                         // Paging is racy, so it is possible the first column of a page is not the last seen one.
                         if (lastSeenPrefix != startPrefix && lastSeenPrefix.equals(firstColumn.name()))
                         {
                             // skip the row we already saw w/ the last page of results
                             indexColumns.poll();
-                            logger.debug("Skipping {}", indexComparator.getString(firstColumn.name()));
+                            logger.trace("Skipping {}", indexComparator.getString(firstColumn.name()));
                         }
                         else if (range instanceof Range && !indexColumns.isEmpty() && firstColumn.name().equals(startPrefix))
                         {
                             // skip key excluded by range
                             indexColumns.poll();
-                            logger.debug("Skipping first key as range excludes it");
+                            logger.trace("Skipping first key as range excludes it");
                         }
                     }
 
                     while (!indexColumns.isEmpty() && columnsCount <= limit)
                     {
-                        IColumn column = indexColumns.poll();
+                        Column column = indexColumns.poll();
                         lastSeenPrefix = column.name();
                         if (column.isMarkedForDelete())
                         {
-                            logger.debug("skipping {}", column.name());
+                            logger.trace("skipping {}", column.name());
                             continue;
                         }
 
@@ -276,7 +279,7 @@ public class CompositesSearcher extends SecondaryIndexSearcher
 
                         if (!range.right.isMinimum(baseCfs.partitioner) && range.right.compareTo(dk) < 0)
                         {
-                            logger.debug("Reached end of assigned scan range");
+                            logger.trace("Reached end of assigned scan range");
                             return endOfData();
                         }
                         if (!range.contains(dk))
@@ -285,7 +288,7 @@ public class CompositesSearcher extends SecondaryIndexSearcher
                             continue;
                         }
 
-                        logger.debug("Adding index hit to current row for {}", indexComparator.getString(lastSeenPrefix));
+                        logger.trace("Adding index hit to current row for {}", indexComparator.getString(lastSeenPrefix));
                         // For sparse composites, we're good querying the whole logical row
                         // Obviously if this index is used for other usage, that might be inefficient
                         CompositeType.Builder builder = baseComparator.builder();
@@ -297,8 +300,8 @@ public class CompositesSearcher extends SecondaryIndexSearcher
                         if (!originalFilter.includes(baseComparator, start))
                             continue;
 
-                        SliceQueryFilter dataFilter = new SliceQueryFilter(start, builder.copy().buildAsEndOfRange(), false, Integer.MAX_VALUE);
-                        ColumnFamily newData = baseCfs.getColumnFamily(new QueryFilter(dk, path, dataFilter));
+                        SliceQueryFilter dataFilter = new SliceQueryFilter(start, builder.copy().buildAsEndOfRange(), false, Integer.MAX_VALUE, prefixSize);
+                        ColumnFamily newData = baseCfs.getColumnFamily(new QueryFilter(dk, baseCfs.name, dataFilter));
                         if (newData != null)
                         {
                             ByteBuffer baseColumnName = builder.copy().add(primary.column_name).build();
@@ -307,7 +310,7 @@ public class CompositesSearcher extends SecondaryIndexSearcher
                             if (isIndexValueStale(newData, baseColumnName, indexedValue))
                             {
                                 // delete the index entry w/ its own timestamp
-                                IColumn dummyColumn = new Column(baseColumnName, indexedValue, column.timestamp());
+                                Column dummyColumn = new Column(baseColumnName, indexedValue, column.timestamp());
                                 ((PerColumnSecondaryIndex) index).delete(dk.key, dummyColumn);
                                 continue;
                             }
@@ -318,7 +321,7 @@ public class CompositesSearcher extends SecondaryIndexSearcher
                             if (data == null)
                                 data = ColumnFamily.create(baseCfs.metadata);
                             data.resolve(newData);
-                            columnsCount += newData.getLiveColumnCount();
+                            columnsCount += dataFilter.lastCounted();
                         }
                     }
                  }

@@ -37,6 +37,7 @@ public abstract class CFStatement extends ParsedStatement
     {
         if (!cfName.hasKeyspace())
         {
+            // XXX: We explicitely only want to call state.getKeyspace() in this case, don't move it outside the if.
             cfName.setKeyspace(state.getKeyspace(), true);
         }
     }

@@ -17,12 +17,14 @@
  */
 package org.apache.cassandra.db.commitlog;
 
+import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -37,8 +39,11 @@ import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.ColumnFamily;
 import org.apache.cassandra.db.RowMutation;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.ByteBufferOutputStream;
+import org.apache.cassandra.io.util.ChecksummedOutputStream;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.PureJavaCrc32;
 
 /*
@@ -67,6 +72,8 @@ public class CommitLogSegment
     private boolean needsSync = false;
 
     private final MappedByteBuffer buffer;
+    private final Checksum checksum;
+    private final DataOutputStream bufferStream;
     private boolean closed;
 
     public final CommitLogDescriptor descriptor;
@@ -120,6 +127,8 @@ public class CommitLogSegment
             logFileAccessor.setLength(DatabaseDescriptor.getCommitLogSegmentSize());
 
             buffer = logFileAccessor.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, DatabaseDescriptor.getCommitLogSegmentSize());
+            checksum = new PureJavaCrc32();
+            bufferStream = new DataOutputStream(new ChecksummedOutputStream(new ByteBufferOutputStream(buffer), checksum));
             buffer.putInt(CommitLog.END_OF_SEGMENT_MARKER);
             buffer.position(0);
 
@@ -202,24 +211,24 @@ public class CommitLogSegment
    /**
      * Appends a row mutation onto the commit log.  Requres that hasCapacityFor has already been checked.
      *
-     * @param   rowMutation   the mutation to append to the commit log.
+     * @param   mutation   the mutation to append to the commit log.
      * @return  the position of the appended mutation
      */
-    public ReplayPosition write(RowMutation rowMutation) throws IOException
+    public ReplayPosition write(RowMutation mutation) throws IOException
     {
         assert !closed;
         ReplayPosition repPos = getContext();
-        markDirty(rowMutation, repPos);
+        markDirty(mutation, repPos);
 
-        Checksum checksum = new PureJavaCrc32();
-        byte[] serializedRow = rowMutation.getSerializedBuffer(MessagingService.current_version);
+        checksum.reset();
 
-        checksum.update(serializedRow.length);
-        buffer.putInt(serializedRow.length);
+        // checksummed length
+        int length = (int) RowMutation.serializer.serializedSize(mutation, MessagingService.current_version);
+        bufferStream.writeInt(length);
         buffer.putLong(checksum.getValue());
 
-        buffer.put(serializedRow);
-        checksum.update(serializedRow, 0, serializedRow.length);
+        // checksummed mutation
+        RowMutation.serializer.serialize(mutation, bufferStream, MessagingService.current_version);
         buffer.putLong(checksum.getValue());
 
         if (buffer.remaining() >= 4)
@@ -373,5 +382,16 @@ public class CommitLogSegment
     public int position()
     {
         return buffer.position();
+    }
+
+    
+    public static class CommitLogSegmentFileComparator implements Comparator<File>
+    {
+        public int compare(File f, File f2)
+        {
+            CommitLogDescriptor desc = CommitLogDescriptor.fromFileName(f.getName());
+            CommitLogDescriptor desc2 = CommitLogDescriptor.fromFileName(f2.getName());
+            return (int) (desc.id - desc2.id);        
+        }
     }
 }

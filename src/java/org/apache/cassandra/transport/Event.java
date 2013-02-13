@@ -25,7 +25,7 @@ import org.jboss.netty.buffer.ChannelBuffers;
 
 public abstract class Event
 {
-    public enum Type { TOPOLOGY_CHANGE, STATUS_CHANGE }
+    public enum Type { TOPOLOGY_CHANGE, STATUS_CHANGE, SCHEMA_CHANGE }
 
     public final Type type;
 
@@ -36,27 +36,28 @@ public abstract class Event
 
     public static Event deserialize(ChannelBuffer cb)
     {
-        switch (Enum.valueOf(Type.class, CBUtil.readString(cb).toUpperCase()))
+        switch (CBUtil.readEnumValue(Type.class, cb))
         {
             case TOPOLOGY_CHANGE:
                 return TopologyChange.deserializeEvent(cb);
             case STATUS_CHANGE:
                 return StatusChange.deserializeEvent(cb);
+            case SCHEMA_CHANGE:
+                return SchemaChange.deserializeEvent(cb);
         }
         throw new AssertionError();
     }
 
     public ChannelBuffer serialize()
     {
-        return ChannelBuffers.wrappedBuffer(CBUtil.stringToCB(type.toString()),
-                                            serializeEvent());
+        return ChannelBuffers.wrappedBuffer(CBUtil.enumValueToCB(type), serializeEvent());
     }
 
     protected abstract ChannelBuffer serializeEvent();
 
     public static class TopologyChange extends Event
     {
-        public enum Change { NEW_NODE, REMOVED_NODE }
+        public enum Change { NEW_NODE, REMOVED_NODE, MOVED_NODE }
 
         public final Change change;
         public final InetSocketAddress node;
@@ -78,18 +79,22 @@ public abstract class Event
             return new TopologyChange(Change.REMOVED_NODE, new InetSocketAddress(host, port));
         }
 
+        public static TopologyChange movedNode(InetAddress host, int port)
+        {
+            return new TopologyChange(Change.MOVED_NODE, new InetSocketAddress(host, port));
+        }
+
         // Assumes the type has already by been deserialized
         private static TopologyChange deserializeEvent(ChannelBuffer cb)
         {
-            Change change = Enum.valueOf(Change.class, CBUtil.readString(cb).toUpperCase());
+            Change change = CBUtil.readEnumValue(Change.class, cb);
             InetSocketAddress node = CBUtil.readInet(cb);
             return new TopologyChange(change, node);
         }
 
         protected ChannelBuffer serializeEvent()
         {
-            return ChannelBuffers.wrappedBuffer(CBUtil.stringToCB(change.toString()),
-                                                CBUtil.inetToCB(node));
+            return ChannelBuffers.wrappedBuffer(CBUtil.enumValueToCB(change), CBUtil.inetToCB(node));
         }
 
         @Override
@@ -126,21 +131,64 @@ public abstract class Event
         // Assumes the type has already by been deserialized
         private static StatusChange deserializeEvent(ChannelBuffer cb)
         {
-            Status status = Enum.valueOf(Status.class, CBUtil.readString(cb).toUpperCase());
+            Status status = CBUtil.readEnumValue(Status.class, cb);
             InetSocketAddress node = CBUtil.readInet(cb);
             return new StatusChange(status, node);
         }
 
         protected ChannelBuffer serializeEvent()
         {
-            return ChannelBuffers.wrappedBuffer(CBUtil.stringToCB(status.toString()),
-                                                CBUtil.inetToCB(node));
+            return ChannelBuffers.wrappedBuffer(CBUtil.enumValueToCB(status), CBUtil.inetToCB(node));
         }
 
         @Override
         public String toString()
         {
             return status + " " + node;
+        }
+    }
+
+    public static class SchemaChange extends Event
+    {
+        public enum Change { CREATED, UPDATED, DROPPED }
+
+        public final Change change;
+        public final String keyspace;
+        public final String table;
+
+        public SchemaChange(Change change, String keyspace, String table)
+        {
+            super(Type.SCHEMA_CHANGE);
+            this.change = change;
+            this.keyspace = keyspace;
+            this.table = table;
+        }
+
+        public SchemaChange(Change change, String keyspace)
+        {
+            this(change, keyspace, "");
+        }
+
+        // Assumes the type has already by been deserialized
+        private static SchemaChange deserializeEvent(ChannelBuffer cb)
+        {
+            Change change = CBUtil.readEnumValue(Change.class, cb);
+            String keyspace = CBUtil.readString(cb);
+            String table = CBUtil.readString(cb);
+            return new SchemaChange(change, keyspace, table);
+        }
+
+        protected ChannelBuffer serializeEvent()
+        {
+            return ChannelBuffers.wrappedBuffer(CBUtil.enumValueToCB(change),
+                                                CBUtil.stringToCB(keyspace),
+                                                CBUtil.stringToCB(table));
+        }
+
+        @Override
+        public String toString()
+        {
+            return change + " " + keyspace + (table.isEmpty() ? "" : "." + table);
         }
     }
 }

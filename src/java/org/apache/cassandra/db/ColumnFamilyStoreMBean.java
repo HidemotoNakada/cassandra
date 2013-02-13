@@ -21,8 +21,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
-import org.apache.cassandra.exceptions.ConfigurationException;
-
 /**
  * The MBean interface for ColumnFamilyStore
  */
@@ -39,6 +37,7 @@ public interface ColumnFamilyStoreMBean
      *
      * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#memtableDataSize
      * @return The size in bytes.
+     * @deprecated
      */
     @Deprecated
     public long getMemtableDataSize();
@@ -63,7 +62,7 @@ public interface ColumnFamilyStoreMBean
     public int getMemtableSwitchCount();
 
     /**
-     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#recentSSTablesPerReadHistogram
+     * @see org.apache.cassandra.metrics.ColumnFamilyMetrics#recentSSTablesPerRead
      * @return a histogram of the number of sstable data files accessed per read: reading this property resets it
      */
     @Deprecated
@@ -259,7 +258,7 @@ public interface ColumnFamilyStoreMBean
      * Sets the compaction strategy by class name
      * @param className the name of the compaction strategy class
      */
-    public void setCompactionStrategyClass(String className) throws ConfigurationException;
+    public void setCompactionStrategyClass(String className);
 
     /**
      * Gets the compaction strategy class name
@@ -275,7 +274,12 @@ public interface ColumnFamilyStoreMBean
      * Set the compression parameters
      * @param opts map of string names to values
      */
-    public void setCompressionParameters(Map<String,String> opts) throws ConfigurationException;
+    public void setCompressionParameters(Map<String,String> opts);
+
+    /**
+     * Set new crc check chance
+     */
+    public void setCrcCheckChance(double crcCheckChance);
 
     /**
      * Disable automatic compaction.
@@ -329,4 +333,10 @@ public interface ColumnFamilyStoreMBean
      *         array index corresponds to level(int[0] is for level 0, ...).
      */
     public int[] getSSTableCountPerLevel();
+
+    /**
+     * Get the ratio of droppable tombstones to real columns (and non-droppable tombstones)
+     * @return ratio
+     */
+    public double getDroppableTombstoneRatio();
 }

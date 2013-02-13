@@ -21,15 +21,47 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.lang.management.ManagementFactory;
+import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
 
-public class BlacklistedDirectories
-{
-    private static final Logger logger = LoggerFactory.getLogger(BlacklistedDirectories.class);
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 
-    private static Set<File> unreadableDirectories = new CopyOnWriteArraySet<File>();
-    private static Set<File> unwritableDirectories = new CopyOnWriteArraySet<File>();
+public class BlacklistedDirectories implements BlacklistedDirectoriesMBean
+{
+    public static final String MBEAN_NAME = "org.apache.cassandra.db:type=BlacklistedDirectories";
+    private static final Logger logger = LoggerFactory.getLogger(BlacklistedDirectories.class);
+    private static final BlacklistedDirectories instance = new BlacklistedDirectories();
+
+    private final Set<File> unreadableDirectories = new CopyOnWriteArraySet<File>();
+    private final Set<File> unwritableDirectories = new CopyOnWriteArraySet<File>();
+
+    private BlacklistedDirectories()
+    {
+        // Register this instance with JMX
+        try
+        {
+            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+            mbs.registerMBean(this, new ObjectName(MBEAN_NAME));
+        }
+        catch (Exception e)
+        {
+            logger.error("error registering MBean " + MBEAN_NAME, e);
+            //Allow the server to start even if the bean can't be registered
+        }
+    }
+
+    public Set<File> getUnreadableDirectories()
+    {
+        return Collections.unmodifiableSet(unreadableDirectories);
+    }
+
+    public Set<File> getUnwritableDirectories()
+    {
+        return Collections.unmodifiableSet(unwritableDirectories);
+    }
 
     /**
      * Adds parent directory of the file (or the file itself, if it is a directory)
@@ -40,7 +72,7 @@ public class BlacklistedDirectories
     public static File maybeMarkUnreadable(File path)
     {
         File directory = getDirectory(path);
-        if (unreadableDirectories.add(directory))
+        if (instance.unreadableDirectories.add(directory))
         {
             logger.warn("Blacklisting {} for reads", directory);
             return directory;
@@ -57,7 +89,7 @@ public class BlacklistedDirectories
     public static File maybeMarkUnwritable(File path)
     {
         File directory = getDirectory(path);
-        if (unwritableDirectories.add(directory))
+        if (instance.unwritableDirectories.add(directory))
         {
             logger.warn("Blacklisting {} for writes", directory);
             return directory;
@@ -71,7 +103,7 @@ public class BlacklistedDirectories
      */
     public static boolean isUnreadable(File directory)
     {
-        return unreadableDirectories.contains(directory);
+        return instance.unreadableDirectories.contains(directory);
     }
 
     /**
@@ -80,7 +112,7 @@ public class BlacklistedDirectories
      */
     public static boolean isUnwritable(File directory)
     {
-        return unwritableDirectories.contains(directory);
+        return instance.unwritableDirectories.contains(directory);
     }
 
     private static File getDirectory(File file)
@@ -95,6 +127,8 @@ public class BlacklistedDirectories
         if (file.getPath().endsWith(".db"))
             return file.getParentFile();
 
-        throw new IllegalStateException("Unable to parse directory from path " + file);
+        // We may not be able to determine if it's a file or a directory if
+        // we were called because we couldn't create the file/directory.
+        return file;
     }
 }

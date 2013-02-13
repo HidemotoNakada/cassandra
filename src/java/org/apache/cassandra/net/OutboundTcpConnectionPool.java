@@ -68,7 +68,7 @@ public class OutboundTcpConnectionPool
     void reset()
     {
         for (OutboundTcpConnection conn : new OutboundTcpConnection[] { cmdCon, ackCon })
-            conn.closeSocket();
+            conn.closeSocket(false);
     }
 
     public void resetToNewerVersion(int version)
@@ -117,14 +117,14 @@ public class OutboundTcpConnectionPool
         if (isEncryptedChannel())
         {
             if (Config.getOutboundBindAny())
-                return SSLFactory.getSocket(DatabaseDescriptor.getEncryptionOptions(), endPoint(), DatabaseDescriptor.getSSLStoragePort());
+                return SSLFactory.getSocket(DatabaseDescriptor.getServerEncryptionOptions(), endPoint(), DatabaseDescriptor.getSSLStoragePort());
             else
-                return SSLFactory.getSocket(DatabaseDescriptor.getEncryptionOptions(), endPoint(), DatabaseDescriptor.getSSLStoragePort(), FBUtilities.getLocalAddress(), 0);
+                return SSLFactory.getSocket(DatabaseDescriptor.getServerEncryptionOptions(), endPoint(), DatabaseDescriptor.getSSLStoragePort(), FBUtilities.getLocalAddress(), 0);
         }
         else
         {
             Socket socket = SocketChannel.open(new InetSocketAddress(endPoint(), DatabaseDescriptor.getStoragePort())).socket();
-            if (Config.getOutboundBindAny())
+            if (Config.getOutboundBindAny() && !socket.isBound())
                 socket.bind(new InetSocketAddress(FBUtilities.getLocalAddress(), 0));
             return socket;
         }
@@ -137,7 +137,7 @@ public class OutboundTcpConnectionPool
 
     boolean isEncryptedChannel()
     {
-        switch (DatabaseDescriptor.getEncryptionOptions().internode_encryption)
+        switch (DatabaseDescriptor.getServerEncryptionOptions().internode_encryption)
         {
             case none:
                 return false; // if nothing needs to be encrypted then return immediately.
@@ -155,5 +155,15 @@ public class OutboundTcpConnectionPool
                 break;
         }
         return true;
+    }
+
+   public void close()
+    {
+        // these null guards are simply for tests
+        if (ackCon != null)
+            ackCon.closeSocket(true);
+        if (cmdCon != null)
+            cmdCon.closeSocket(true);
+        metrics.release();
     }
 }

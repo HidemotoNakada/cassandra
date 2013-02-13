@@ -26,6 +26,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.yammer.metrics.core.TimerContext;
 import org.apache.cassandra.db.ColumnFamilyType;
 import org.apache.cassandra.stress.Session;
 import org.apache.cassandra.stress.util.CassandraClient;
@@ -54,9 +55,12 @@ public class CqlInserter extends Operation
         // Construct a query string once.
         if (cqlQuery == null)
         {
-            StringBuilder query = new StringBuilder("UPDATE ").append(wrapInQuotesIfRequired("Standard1"))
-                    .append(" USING CONSISTENCY ")
-                    .append(session.getConsistencyLevel().toString()).append(" SET ");
+            StringBuilder query = new StringBuilder("UPDATE ").append(wrapInQuotesIfRequired("Standard1"));
+
+            if (session.cqlVersion.startsWith("2"))
+                query.append(" USING CONSISTENCY ").append(session.getConsistencyLevel().toString());
+
+            query.append(" SET ");
 
             for (int i = 0; i < session.getColumnsPerKey(); i++)
             {
@@ -68,7 +72,7 @@ public class CqlInserter extends Operation
                     if (session.cqlVersion.startsWith("3"))
                         throw new UnsupportedOperationException("Cannot use UUIDs in column names with CQL3");
 
-                    query.append(wrapInQuotesIfRequired(UUIDGen.makeType1UUIDFromHost(Session.getLocalAddress()).toString()))
+                    query.append(wrapInQuotesIfRequired(UUIDGen.getTimeUUID().toString()))
                          .append(" = ?");
                 }
                 else
@@ -93,7 +97,7 @@ public class CqlInserter extends Operation
 
         String formattedQuery = null;
 
-        long start = System.currentTimeMillis();
+        TimerContext context = session.latency.time();
 
         boolean success = false;
         String exceptionMessage = null;
@@ -108,13 +112,19 @@ public class CqlInserter extends Operation
                 if (session.usePreparedStatements())
                 {
                     Integer stmntId = getPreparedStatement(client, cqlQuery);
-                    client.execute_prepared_cql_query(stmntId, queryParamsAsByteBuffer(queryParms));
+                    if (session.cqlVersion.startsWith("3"))
+                        client.execute_prepared_cql3_query(stmntId, queryParamsAsByteBuffer(queryParms), session.getConsistencyLevel());
+                    else
+                        client.execute_prepared_cql_query(stmntId, queryParamsAsByteBuffer(queryParms));
                 }
                 else
                 {
                     if (formattedQuery == null)
                         formattedQuery = formatCqlQuery(cqlQuery, queryParms);
-                    client.execute_cql_query(ByteBuffer.wrap(formattedQuery.getBytes()), Compression.NONE);
+                    if (session.cqlVersion.startsWith("3"))
+                        client.execute_cql3_query(ByteBuffer.wrap(formattedQuery.getBytes()), Compression.NONE, session.getConsistencyLevel());
+                    else
+                        client.execute_cql_query(ByteBuffer.wrap(formattedQuery.getBytes()), Compression.NONE);
                 }
 
                 success = true;
@@ -138,6 +148,6 @@ public class CqlInserter extends Operation
 
         session.operations.getAndIncrement();
         session.keys.getAndIncrement();
-        session.latency.getAndAdd(System.currentTimeMillis() - start);
+        context.stop();
     }
 }

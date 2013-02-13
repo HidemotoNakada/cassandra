@@ -20,10 +20,12 @@ package org.apache.cassandra.net;
 import java.io.*;
 import java.net.InetAddress;
 import java.net.Socket;
+import java.net.SocketException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.io.util.FastByteArrayInputStream;
 import org.apache.cassandra.streaming.IncomingStreamReader;
@@ -41,6 +43,17 @@ public class IncomingTcpConnection extends Thread
     {
         assert socket != null;
         this.socket = socket;
+        if (DatabaseDescriptor.getInternodeRecvBufferSize() != null)
+        {
+            try
+            {
+                this.socket.setReceiveBufferSize(DatabaseDescriptor.getInternodeRecvBufferSize().intValue());
+            }
+            catch (SocketException se)
+            {
+                logger.warn("Failed to set receive buffer size on internode socket.", se);
+            }
+        }
     }
 
     /**
@@ -178,9 +191,14 @@ public class IncomingTcpConnection extends Thread
             input.readInt(); // size of entire message. in 1.0+ this is just a placeholder
 
         String id = input.readUTF();
-        long timestamp = version >= MessagingService.VERSION_12
-                       ? (System.currentTimeMillis() | 0x00000000FFFFFFFFL) & input.readInt()
-                       : System.currentTimeMillis();
+        long timestamp = System.currentTimeMillis();;
+        if (version >= MessagingService.VERSION_12)
+        {
+            // make sure to readInt, even if cross_node_to is not enabled
+            int partial = input.readInt();
+            if (DatabaseDescriptor.hasCrossNodeTimeout())
+                timestamp = (timestamp & 0xFFFFFFFF00000000L) | (((partial & 0xFFFFFFFFL) << 2) >> 2);
+        }
 
         MessageIn message = MessageIn.read(input, version, id);
         if (message == null)

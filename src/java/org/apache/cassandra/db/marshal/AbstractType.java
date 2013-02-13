@@ -21,9 +21,11 @@ import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Map;
+import java.util.Set;
 
+import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.db.IColumn;
+import org.apache.cassandra.db.Column;
 import org.apache.cassandra.db.OnDiskAtom;
 import org.apache.cassandra.db.RangeTombstone;
 import static org.apache.cassandra.io.sstable.IndexHelper.IndexInfo;
@@ -40,8 +42,8 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
 {
     public final Comparator<IndexInfo> indexComparator;
     public final Comparator<IndexInfo> indexReverseComparator;
-    public final Comparator<IColumn> columnComparator;
-    public final Comparator<IColumn> columnReverseComparator;
+    public final Comparator<Column> columnComparator;
+    public final Comparator<Column> columnReverseComparator;
     public final Comparator<OnDiskAtom> onDiskAtomComparator;
     public final Comparator<ByteBuffer> reverseComparator;
 
@@ -61,16 +63,16 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
                 return AbstractType.this.compare(o1.firstName, o2.firstName);
             }
         };
-        columnComparator = new Comparator<IColumn>()
+        columnComparator = new Comparator<Column>()
         {
-            public int compare(IColumn c1, IColumn c2)
+            public int compare(Column c1, Column c2)
             {
                 return AbstractType.this.compare(c1.name(), c2.name());
             }
         };
-        columnReverseComparator = new Comparator<IColumn>()
+        columnReverseComparator = new Comparator<Column>()
         {
-            public int compare(IColumn c1, IColumn c2)
+            public int compare(Column c1, Column c2)
             {
                 return AbstractType.this.compare(c2.name(), c1.name());
             }
@@ -138,8 +140,20 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     /** get a byte representation of the given string. */
     public abstract ByteBuffer fromString(String source) throws MarshalException;
 
+    /** for compatibility with TimeUUID in CQL2. See TimeUUIDType (that overrides it). */
+    public ByteBuffer fromStringCQL2(String source) throws MarshalException
+    {
+        return fromString(source);
+    }
+
     /* validate that the byte array is a valid sequence for the type we are supposed to be comparing */
     public abstract void validate(ByteBuffer bytes) throws MarshalException;
+
+    /* Most of our internal type should override that. */
+    public CQL3Type asCQL3Type()
+    {
+        return new CQL3Type.Custom(this);
+    }
 
     /** @deprecated use reverseComparator field instead */
     public Comparator<ByteBuffer> getReverseComparator()
@@ -159,10 +173,10 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     }
 
     /* convenience method */
-    public String getColumnsString(Collection<IColumn> columns)
+    public String getColumnsString(Collection<Column> columns)
     {
         StringBuilder builder = new StringBuilder();
-        for (IColumn column : columns)
+        for (Column column : columns)
         {
             builder.append(column.getString(this)).append(",");
         }

@@ -26,7 +26,7 @@ import org.jboss.netty.buffer.ChannelBuffers;
 import org.jboss.netty.channel.*;
 import org.jboss.netty.handler.codec.oneone.OneToOneDecoder;
 import org.jboss.netty.handler.codec.oneone.OneToOneEncoder;
-import org.jboss.netty.handler.codec.frame.LengthFieldBasedFrameDecoder;
+import org.jboss.netty.handler.codec.frame.*;
 
 import org.apache.cassandra.utils.ByteBufferUtil;
 
@@ -75,9 +75,8 @@ public class Frame
         return new Frame(header, fullFrame, connection);
     }
 
-    public static Frame create(Message.Type type, int streamId, ChannelBuffer body, Connection connection)
+    public static Frame create(Message.Type type, int streamId, EnumSet<Header.Flag> flags, ChannelBuffer body, Connection connection)
     {
-        EnumSet<Header.Flag> flags = EnumSet.noneOf(Header.Flag.class);
         Header header = new Header(Header.CURRENT_VERSION, flags, streamId, type);
         return new Frame(header, body, connection);
     }
@@ -108,7 +107,8 @@ public class Frame
         public static enum Flag
         {
             // The order of that enum matters!!
-            COMPRESSED;
+            COMPRESSED,
+            TRACING;
 
             public static EnumSet<Flag> deserialize(int flags)
             {
@@ -144,7 +144,7 @@ public class Frame
 
         public Decoder(Connection.Tracker tracker, Connection.Factory factory)
         {
-            super(MAX_FRAME_LENTH, 4, 4);
+            super(MAX_FRAME_LENTH, 4, 4, 0, 0, true);
             this.connection = factory.newConnection(tracker);
         }
 
@@ -156,22 +156,43 @@ public class Frame
         }
 
         @Override
-        protected Object decode (ChannelHandlerContext ctx, Channel channel, ChannelBuffer buffer)
+        protected Object decode(ChannelHandlerContext ctx, Channel channel, ChannelBuffer buffer)
         throws Exception
         {
-            ChannelBuffer frame = (ChannelBuffer) super.decode(ctx, channel, buffer);
-            if (frame == null)
+            try
             {
-                return null;
-            }
-            return Frame.create(frame, connection);
-        }
+                // We must at least validate that the frame version is something we support/know and it doesn't hurt to
+                // check the opcode is not garbage. And we should do that indenpently of what is the the bytes corresponding
+                // to the frame length are, i.e. we shouldn't wait for super.decode() to return non-null.
+                if (buffer.readableBytes() == 0)
+                    return null;
 
-        @Override
-        protected ChannelBuffer extractFrame(ChannelBuffer buffer, int index, int length)
-        {
-            // Don't copy
-            return buffer.slice(index, length);
+                int firstByte = buffer.getByte(0);
+                Message.Direction direction = Message.Direction.extractFromVersion(firstByte);
+                int version = firstByte & 0x7F;
+                // We really only support the current version so far
+                if (version != Header.CURRENT_VERSION)
+                    throw new ProtocolException("Invalid or unsupported protocol version: " + version);
+
+                // Validate the opcode
+                if (buffer.readableBytes() >= 4)
+                    Message.Type.fromOpcode(buffer.getByte(3), direction);
+
+                ChannelBuffer frame = (ChannelBuffer) super.decode(ctx, channel, buffer);
+                if (frame == null)
+                {
+                    return null;
+                }
+                return Frame.create(frame, connection);
+            }
+            catch (CorruptedFrameException e)
+            {
+                throw new ProtocolException(e.getMessage());
+            }
+            catch (TooLongFrameException e)
+            {
+                throw new ProtocolException(e.getMessage());
+            }
         }
     }
 

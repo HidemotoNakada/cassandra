@@ -64,7 +64,7 @@ public class DataTracker
         return view.get().memtablesPendingFlush;
     }
 
-    public List<SSTableReader> getSSTables()
+    public Set<SSTableReader> getSSTables()
     {
         return view.get().sstables;
     }
@@ -123,13 +123,17 @@ public class DataTracker
 
     public void replaceFlushed(Memtable memtable, SSTableReader sstable)
     {
+        // sstable may be null if we flushed batchlog and nothing needed to be retained
+
         if (!cfstore.isValid())
         {
             View currentView, newView;
             do
             {
                 currentView = view.get();
-                newView = currentView.replaceFlushed(memtable, sstable).replace(Arrays.asList(sstable), Collections.<SSTableReader>emptyList());
+                newView = currentView.replaceFlushed(memtable, sstable);
+                if (sstable != null)
+                    newView = newView.replace(Arrays.asList(sstable), Collections.<SSTableReader>emptyList());
             }
             while (!view.compareAndSet(currentView, newView));
             return;
@@ -143,10 +147,12 @@ public class DataTracker
         }
         while (!view.compareAndSet(currentView, newView));
 
-        addNewSSTablesSize(Arrays.asList(sstable));
-
-        notifyAdded(sstable);
-        incrementallyBackup(sstable);
+        if (sstable != null)
+        {
+            addNewSSTablesSize(Arrays.asList(sstable));
+            notifyAdded(sstable);
+            incrementallyBackup(sstable);
+        }
     }
 
     public void incrementallyBackup(final SSTableReader sstable)
@@ -166,46 +172,23 @@ public class DataTracker
     }
 
     /**
-     * @return A subset of the given active sstables that have been marked compacting,
-     * or null if the thresholds cannot be met: files that are marked compacting must
-     * later be unmarked using unmarkCompacting.
+     * @return true if we are able to mark the given @param sstables as compacted, before anyone else
      *
      * Note that we could acquire references on the marked sstables and release them in
      * unmarkCompacting, but since we will never call markCompacted on a sstable marked
      * as compacting (unless there is a serious bug), we can skip this.
      */
-    public Set<SSTableReader> markCompacting(Collection<SSTableReader> tomark, int min, int max)
+    public boolean markCompacting(Collection<SSTableReader> sstables)
     {
-        if (max < min || max < 1)
-            return null;
-        if (tomark == null || tomark.isEmpty())
-            return null;
+        assert sstables != null && !sstables.isEmpty();
 
-        View currentView, newView;
-        Set<SSTableReader> subset = null;
-        // order preserving set copy of the input
-        Set<SSTableReader> remaining = new LinkedHashSet<SSTableReader>(tomark);
-        do
-        {
-            currentView = view.get();
+        View currentView = view.get();
+        Set<SSTableReader> inactive = Sets.difference(ImmutableSet.copyOf(sstables), currentView.compacting);
+        if (inactive.size() < sstables.size())
+            return false;
 
-            // find the subset that is active and not already compacting
-            remaining.removeAll(currentView.compacting);
-            remaining.retainAll(currentView.sstables);
-            if (remaining.size() < min)
-                // cannot meet the min threshold
-                return null;
-
-            // cap the newly compacting items into a subset set
-            subset = new HashSet<SSTableReader>();
-            Iterator<SSTableReader> iter = remaining.iterator();
-            for (int added = 0; added < max && iter.hasNext(); added++)
-                subset.add(iter.next());
-
-            newView = currentView.markCompacting(subset);
-        }
-        while (!view.compareAndSet(currentView, newView));
-        return subset;
+        View newView = currentView.markCompacting(inactive);
+        return view.compareAndSet(currentView, newView);
     }
 
     /**
@@ -317,7 +300,7 @@ public class DataTracker
     {
         view.set(new View(new Memtable(cfstore),
                           Collections.<Memtable>emptySet(),
-                          Collections.<SSTableReader>emptyList(),
+                          Collections.<SSTableReader>emptySet(),
                           Collections.<SSTableReader>emptySet(),
                           SSTableIntervalTree.empty()));
     }
@@ -354,7 +337,7 @@ public class DataTracker
             assert sstable.getKeySamples() != null;
             if (logger.isDebugEnabled())
                 logger.debug(String.format("adding %s to list of files tracked for %s.%s",
-                            sstable.descriptor, cfstore.table.name, cfstore.getColumnFamilyName()));
+                            sstable.descriptor, cfstore.table.getName(), cfstore.name));
             long size = sstable.bytesOnDisk();
             StorageMetrics.load.inc(size);
             cfstore.metric.liveDiskSpaceUsed.inc(size);
@@ -369,7 +352,7 @@ public class DataTracker
         {
             if (logger.isDebugEnabled())
                 logger.debug(String.format("removing %s from list of files tracked for %s.%s",
-                            sstable.descriptor, cfstore.table.name, cfstore.getColumnFamilyName()));
+                            sstable.descriptor, cfstore.table.getName(), cfstore.name));
             long size = sstable.bytesOnDisk();
             StorageMetrics.load.dec(size);
             cfstore.metric.liveDiskSpaceUsed.dec(size);
@@ -404,6 +387,24 @@ public class DataTracker
             count++;
         }
         return count > 0 ? (int) (sum / count) : 0;
+    }
+
+    public double getDroppableTombstoneRatio()
+    {
+        double allDroppable = 0;
+        long allColumns = 0;
+        int localTime = (int)(System.currentTimeMillis()/1000);
+
+        for (SSTableReader sstable : getSSTables())
+        {
+            allDroppable += sstable.getDroppableTombstonesBefore(localTime - sstable.metadata.getGcGraceSeconds());
+            allColumns += sstable.getEstimatedColumnCount().mean() * sstable.getEstimatedColumnCount().count();
+        }
+        if (allColumns > 0)
+        {
+            return allDroppable / allColumns;
+        }
+        return 0;
     }
 
     public void notifySSTablesChanged(Iterable<SSTableReader> removed, Iterable<SSTableReader> added, OperationType compactionType)
@@ -443,6 +444,11 @@ public class DataTracker
         return new SSTableIntervalTree(intervals);
     }
 
+    public Set<SSTableReader> getCompacting()
+    {
+        return getView().compacting;
+    }
+
     public static class SSTableIntervalTree extends IntervalTree<RowPosition, SSTableReader, Interval<RowPosition, SSTableReader>>
     {
         private static final SSTableIntervalTree EMPTY = new SSTableIntervalTree(null);
@@ -468,15 +474,10 @@ public class DataTracker
         public final Memtable memtable;
         public final Set<Memtable> memtablesPendingFlush;
         public final Set<SSTableReader> compacting;
-        // We can't use a SortedSet here because "the ordering maintained by a sorted set (whether or not an
-        // explicit comparator is provided) must be <i>consistent with equals</i>."  In particular,
-        // ImmutableSortedSet will ignore any objects that compare equally with an existing Set member.
-        // Obviously, dropping sstables whose max column timestamp happens to be equal to another's
-        // is not acceptable for us.  So, we use a List instead.
-        public final List<SSTableReader> sstables;
+        public final Set<SSTableReader> sstables;
         public final SSTableIntervalTree intervalTree;
 
-        View(Memtable memtable, Set<Memtable> pendingFlush, List<SSTableReader> sstables, Set<SSTableReader> compacting, SSTableIntervalTree intervalTree)
+        View(Memtable memtable, Set<Memtable> pendingFlush, Set<SSTableReader> sstables, Set<SSTableReader> compacting, SSTableIntervalTree intervalTree)
         {
             this.memtable = memtable;
             this.memtablesPendingFlush = pendingFlush;
@@ -504,16 +505,18 @@ public class DataTracker
         public View replaceFlushed(Memtable flushedMemtable, SSTableReader newSSTable)
         {
             Set<Memtable> newPending = ImmutableSet.copyOf(Sets.difference(memtablesPendingFlush, Collections.singleton(flushedMemtable)));
-            List<SSTableReader> newSSTables = newSSTables(newSSTable);
+            Set<SSTableReader> newSSTables = newSSTable == null
+                                            ? sstables
+                                            : newSSTables(newSSTable);
             SSTableIntervalTree intervalTree = buildIntervalTree(newSSTables);
-            return new View(memtable, newPending, Collections.unmodifiableList(newSSTables), compacting, intervalTree);
+            return new View(memtable, newPending, newSSTables, compacting, intervalTree);
         }
 
         public View replace(Collection<SSTableReader> oldSSTables, Iterable<SSTableReader> replacements)
         {
-            List<SSTableReader> newSSTables = newSSTables(oldSSTables, replacements);
+            Set<SSTableReader> newSSTables = newSSTables(oldSSTables, replacements);
             SSTableIntervalTree intervalTree = buildIntervalTree(newSSTables);
-            return new View(memtable, memtablesPendingFlush, Collections.unmodifiableList(newSSTables), compacting, intervalTree);
+            return new View(memtable, memtablesPendingFlush, newSSTables, compacting, intervalTree);
         }
 
         public View markCompacting(Collection<SSTableReader> tomark)
@@ -528,18 +531,19 @@ public class DataTracker
             return new View(memtable, memtablesPendingFlush, sstables, compactingNew, intervalTree);
         }
 
-        private List<SSTableReader> newSSTables(SSTableReader newSSTable)
+        private Set<SSTableReader> newSSTables(SSTableReader newSSTable)
         {
+            assert newSSTable != null;
             // not performance-sensitive, don't obsess over doing a selection merge here
             return newSSTables(Collections.<SSTableReader>emptyList(), Collections.singletonList(newSSTable));
         }
 
-        private List<SSTableReader> newSSTables(Collection<SSTableReader> oldSSTables, Iterable<SSTableReader> replacements)
+        private Set<SSTableReader> newSSTables(Collection<SSTableReader> oldSSTables, Iterable<SSTableReader> replacements)
         {
             ImmutableSet<SSTableReader> oldSet = ImmutableSet.copyOf(oldSSTables);
             int newSSTablesSize = sstables.size() - oldSSTables.size() + Iterables.size(replacements);
             assert newSSTablesSize >= Iterables.size(replacements) : String.format("Incoherent new size %d replacing %s by %s in %s", newSSTablesSize, oldSSTables, replacements, this);
-            List<SSTableReader> newSSTables = new ArrayList<SSTableReader>(newSSTablesSize);
+            Set<SSTableReader> newSSTables = new HashSet<SSTableReader>(newSSTablesSize);
             for (SSTableReader sstable : sstables)
             {
                 if (!oldSet.contains(sstable))
@@ -547,7 +551,7 @@ public class DataTracker
             }
             Iterables.addAll(newSSTables, replacements);
             assert newSSTables.size() == newSSTablesSize : String.format("Expecting new size of %d, got %d while replacing %s by %s in %s", newSSTablesSize, newSSTables.size(), oldSSTables, replacements, this);
-            return newSSTables;
+            return ImmutableSet.copyOf(newSSTables);
         }
 
         @Override

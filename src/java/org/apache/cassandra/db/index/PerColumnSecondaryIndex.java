@@ -19,9 +19,7 @@ package org.apache.cassandra.db.index;
 
 import java.nio.ByteBuffer;
 
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.IColumn;
-import org.apache.cassandra.thrift.Column;
+import org.apache.cassandra.db.Column;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
@@ -36,7 +34,7 @@ public abstract class PerColumnSecondaryIndex extends SecondaryIndex
      * @param rowKey the underlying row key which is indexed
      * @param col all the column info
      */
-    public abstract void delete(ByteBuffer rowKey, IColumn col);
+    public abstract void delete(ByteBuffer rowKey, Column col);
 
     /**
      * insert a column to the index
@@ -44,7 +42,7 @@ public abstract class PerColumnSecondaryIndex extends SecondaryIndex
      * @param rowKey the underlying row key which is indexed
      * @param col all the column info
      */
-    public abstract void insert(ByteBuffer rowKey, IColumn col);
+    public abstract void insert(ByteBuffer rowKey, Column col);
 
     /**
      * update a column from the index
@@ -52,16 +50,16 @@ public abstract class PerColumnSecondaryIndex extends SecondaryIndex
      * @param rowKey the underlying row key which is indexed
      * @param col all the column info
      */
-    public abstract void update(ByteBuffer rowKey, IColumn col);
+    public abstract void update(ByteBuffer rowKey, Column col);
 
     public String getNameForSystemTable(ByteBuffer column)
     {
         return getIndexName();
     }
-    
+
     @Override
     public boolean validate(Column column)
     {
-        return column.value.remaining() < FBUtilities.MAX_UNSIGNED_SHORT;
+        return column.value().remaining() < FBUtilities.MAX_UNSIGNED_SHORT;
     }
 }

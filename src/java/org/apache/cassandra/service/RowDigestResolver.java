@@ -35,7 +35,7 @@ public class RowDigestResolver extends AbstractRowResolver
     /**
      * Special case of resolve() so that CL.ONE reads never throw DigestMismatchException in the foreground
      */
-    public Row getData() throws IOException
+    public Row getData()
     {
         for (MessageIn<ReadResponse> message : replies)
         {
@@ -43,8 +43,7 @@ public class RowDigestResolver extends AbstractRowResolver
             if (!result.isDigestQuery())
                 return result.row();
         }
-
-        throw new AssertionError("getData should not be invoked when no data is present");
+        return null;
     }
 
     /*
@@ -95,7 +94,7 @@ public class RowDigestResolver extends AbstractRowResolver
         // with the data response. If there is a mismatch then throw an exception so that read repair can happen.
         //
         // It's important to note that we do not consider the possibility of multiple data responses --
-        // that can only happen when we're doing the repair post-mismatch, and will be handled by RowRepairResolver.
+        // that can only happen when we're doing the repair post-mismatch, and will be handled by RowDataResolver.
         if (digest != null)
         {
             ByteBuffer digest2 = ColumnFamily.digest(data);

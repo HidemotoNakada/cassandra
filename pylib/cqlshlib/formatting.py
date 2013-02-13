@@ -16,6 +16,7 @@
 
 import re
 import time
+import binascii
 from collections import defaultdict
 from . import wcwidth
 from .displaying import colorme, FormattedValue, DEFAULT_VALUE_COLORS
@@ -66,13 +67,29 @@ def format_by_type(cqltype, val, encoding, colormap=None, addcolor=False,
                         time_format=time_format, float_precision=float_precision,
                         nullval=nullval)
 
+def color_text(bval, colormap, displaywidth=None):
+    # note that here, we render natural backslashes as just backslashes,
+    # in the same color as surrounding text, when using color. When not
+    # using color, we need to double up the backslashes so it's not
+    # ambiguous. This introduces the unique difficulty of having different
+    # display widths for the colored and non-colored versions. To avoid
+    # adding the smarts to handle that in to FormattedValue, we just
+    # make an explicit check to see if a null colormap is being used or
+    # not.
+
+    if displaywidth is None:
+        displaywidth = len(bval)
+    tbr = _make_turn_bits_red_f(colormap['hex'], colormap['text'])
+    coloredval = colormap['text'] + bits_to_turn_red_re.sub(tbr, bval) + colormap['reset']
+    if colormap['text']:
+        displaywidth -= bval.count(r'\\')
+    return FormattedValue(bval, coloredval, displaywidth)
+
 def format_value_default(val, colormap, **_):
     val = str(val)
     escapedval = val.replace('\\', '\\\\')
     bval = controlchars_re.sub(_show_control_chars, escapedval)
-    tbr = _make_turn_bits_red_f(colormap['hex'], colormap['text'])
-    coloredval = colormap['text'] + bits_to_turn_red_re.sub(tbr, bval) + colormap['reset']
-    return FormattedValue(bval, coloredval)
+    return color_text(bval, colormap)
 
 # Mapping cql type base names ("int", "map", etc) to formatter functions,
 # making format_value a generic function
@@ -88,8 +105,8 @@ def formatter_for(typname):
         return f
     return registrator
 
-@formatter_for('bytes')
-def format_value_bytes(val, colormap, **_):
+@formatter_for('blob')
+def format_value_blob(val, colormap, **_):
     bval = ''.join('%02x' % ord(c) for c in val)
     return colorme(bval, colormap, 'hex')
 
@@ -104,6 +121,8 @@ def format_value_decimal(val, colormap, **_):
 @formatter_for('uuid')
 def format_value_uuid(val, colormap, **_):
     return format_python_formatted_type(val, colormap, 'uuid')
+
+formatter_for('timeuuid')(format_value_uuid)
 
 @formatter_for('inet')
 def formatter_value_inet(val, colormap, **_):
@@ -132,14 +151,25 @@ formatter_for('counter')(format_integer_type)
 
 @formatter_for('timestamp')
 def format_value_timestamp(val, colormap, time_format, **_):
-    bval = time.strftime(time_format, time.localtime(val))
+    bval = strftime(time_format, val)
     return colorme(bval, colormap, 'timestamp')
 
-@formatter_for('timeuuid')
-def format_value_timeuuid(val, colormap, time_format, **_):
-    utime = cqltypes.unix_time_from_uuid1(val)
-    bval = time.strftime(time_format, time.localtime(utime))
-    return colorme(bval, colormap, 'timestamp')
+def strftime(time_format, seconds):
+    local = time.localtime(seconds)
+    formatted = time.strftime(time_format, local)
+    if local.tm_isdst != 0:
+        offset = -time.altzone
+    else:
+        offset = -time.timezone
+    if formatted[-4:] != '0000' or time_format[-2:] != '%z' or offset == 0:
+        return formatted
+    # deal with %z on platforms where it isn't supported. see CASSANDRA-4746.
+    if offset < 0:
+        sign = '-'
+    else:
+        sign = '+'
+    hours, minutes = divmod(abs(offset) / 60, 60)
+    return formatted[:-5] + sign + '{0:0=2}{1:0=2}'.format(hours, minutes)
 
 @formatter_for('text')
 def format_value_text(val, encoding, colormap, **_):
@@ -147,9 +177,7 @@ def format_value_text(val, encoding, colormap, **_):
     escapedval = unicode_controlchars_re.sub(_show_control_chars, escapedval)
     bval = escapedval.encode(encoding, 'backslashreplace')
     displaywidth = wcwidth.wcswidth(bval.decode(encoding))
-    tbr = _make_turn_bits_red_f(colormap['hex'], colormap['text'])
-    coloredval = colormap['text'] + bits_to_turn_red_re.sub(tbr, bval) + colormap['reset']
-    return FormattedValue(bval, coloredval)
+    return color_text(bval, colormap, displaywidth)
 
 # name alias
 formatter_for('varchar')(format_value_text)

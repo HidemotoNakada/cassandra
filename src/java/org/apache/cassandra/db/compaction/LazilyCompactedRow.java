@@ -23,7 +23,6 @@ import java.security.MessageDigest;
 import java.util.Iterator;
 import java.util.List;
 
-import com.google.common.base.Functions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Iterators;
 import org.slf4j.Logger;
@@ -37,7 +36,6 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.sstable.ColumnStats;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.util.DataOutputBuffer;
-import org.apache.cassandra.utils.HeapAllocator;
 import org.apache.cassandra.utils.MergeIterator;
 import org.apache.cassandra.utils.StreamingHistogram;
 
@@ -73,18 +71,20 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
         super(rows.get(0).getKey());
         this.rows = rows;
         this.controller = controller;
-        this.shouldPurge = controller.shouldPurge(key);
         indexer = controller.cfs.indexManager.updaterFor(key, false);
 
+        long maxDelTimestamp = Long.MIN_VALUE;
         for (OnDiskAtomIterator row : rows)
         {
             ColumnFamily cf = row.getColumnFamily();
+            maxDelTimestamp = Math.max(maxDelTimestamp, cf.deletionInfo().maxTimestamp());
 
             if (emptyColumnFamily == null)
                 emptyColumnFamily = cf;
             else
                 emptyColumnFamily.delete(cf);
         }
+        this.shouldPurge = controller.shouldPurge(key, maxDelTimestamp);
 
         try
         {
@@ -96,7 +96,9 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
         }
         // reach into the reducer used during iteration to get column count, size, max column timestamp
         // (however, if there are zero columns, iterator() will not be called by ColumnIndexer and reducer will be null)
-        columnStats = new ColumnStats(reducer == null ? 0 : reducer.columns, reducer == null ? Long.MIN_VALUE : reducer.maxTimestampSeen,
+        columnStats = new ColumnStats(reducer == null ? 0 : reducer.columns, 
+                                      reducer == null ? Long.MAX_VALUE : reducer.minTimestampSeen, 
+                                      reducer == null ? maxDelTimestamp : Math.max(maxDelTimestamp, reducer.maxTimestampSeen),
                                       reducer == null ? new StreamingHistogram(SSTable.TOMBSTONE_HISTOGRAM_BIN_SIZE) : reducer.tombstones
         );
         columnSerializedSize = reducer == null ? 0 : reducer.serializedSize;
@@ -198,7 +200,7 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
         return columnStats;
     }
 
-    private void close()
+    public void close()
     {
         for (OnDiskAtomIterator row : rows)
         {
@@ -238,6 +240,7 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
 
         long serializedSize = 4; // int for column count
         int columns = 0;
+        long minTimestampSeen = Long.MAX_VALUE;
         long maxTimestampSeen = Long.MIN_VALUE;
         StreamingHistogram tombstones = new StreamingHistogram(SSTable.TOMBSTONE_HISTOGRAM_BIN_SIZE);
 
@@ -249,7 +252,7 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
             }
             else
             {
-                IColumn column = (IColumn) current;
+                Column column = (Column) current;
                 container.addColumn(column);
                 if (container.getColumn(column.name()) != column)
                     indexer.remove(column);
@@ -281,7 +284,7 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
                     container.clear();
                     return null;
                 }
-                IColumn reduced = purged.iterator().next();
+                Column reduced = purged.iterator().next();
                 container.clear();
 
                 // PrecompactedRow.removeDeletedAndOldShards have only checked the top-level CF deletion times,
@@ -292,6 +295,7 @@ public class LazilyCompactedRow extends AbstractCompactedRow implements Iterable
 
                 serializedSize += reduced.serializedSizeForSSTable();
                 columns++;
+                minTimestampSeen = Math.min(minTimestampSeen, reduced.minTimestamp());
                 maxTimestampSeen = Math.max(maxTimestampSeen, reduced.maxTimestamp());
                 int deletionTime = reduced.getLocalDeletionTime();
                 if (deletionTime < Integer.MAX_VALUE)

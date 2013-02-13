@@ -18,35 +18,25 @@
 package org.apache.cassandra.cql3.statements;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
-import org.apache.cassandra.auth.Permission;
-
+import org.apache.cassandra.exceptions.*;
 import org.apache.commons.lang.StringUtils;
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.Multiset;
 
+import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.*;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.exceptions.RequestValidationException;
-import org.apache.cassandra.exceptions.UnauthorizedException;
 import org.apache.cassandra.db.ColumnFamilyType;
-import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.CollectionType;
-import org.apache.cassandra.db.marshal.ColumnToCollectionType;
-import org.apache.cassandra.db.marshal.CompositeType;
-import org.apache.cassandra.db.marshal.ReversedType;
-import org.apache.cassandra.db.marshal.CounterColumnType;
-import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.io.compress.CompressionParameters;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.thrift.CqlResult;
+import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /** A <code>CREATE COLUMNFAMILY</code> parsed from a CQL query statement. */
@@ -67,11 +57,25 @@ public class CreateColumnFamilyStatement extends SchemaAlteringStatement
     {
         super(name);
         this.properties = properties;
+
+        try
+        {
+            if (!this.properties.hasProperty(CFPropDefs.KW_COMPRESSION) && CFMetaData.DEFAULT_COMPRESSOR != null)
+                this.properties.addProperty(CFPropDefs.KW_COMPRESSION,
+                                            new HashMap<String, String>()
+                                            {{
+                                                put(CompressionParameters.SSTABLE_COMPRESSION, CFMetaData.DEFAULT_COMPRESSOR);
+                                            }});
+        }
+        catch (SyntaxException e)
+        {
+            throw new AssertionError(e);
+        }
     }
 
     public void checkAccess(ClientState state) throws UnauthorizedException, InvalidRequestException
     {
-        state.hasColumnFamilyAccess(keyspace(), columnFamily(), Permission.CREATE);
+        state.hasKeyspaceAccess(keyspace(), Permission.CREATE);
     }
 
     // Column definitions
@@ -98,6 +102,11 @@ public class CreateColumnFamilyStatement extends SchemaAlteringStatement
     public void announceMigration() throws RequestValidationException
     {
         MigrationManager.announceNewColumnFamily(getCFMetaData());
+    }
+
+    public ResultMessage.SchemaChange.Change changeType()
+    {
+        return ResultMessage.SchemaChange.Change.CREATED;
     }
 
     /**
@@ -133,12 +142,12 @@ public class CreateColumnFamilyStatement extends SchemaAlteringStatement
 
     public static class RawStatement extends CFStatement
     {
-        private final Map<ColumnIdentifier, ParsedType> definitions = new HashMap<ColumnIdentifier, ParsedType>();
+        private final Map<ColumnIdentifier, CQL3Type> definitions = new HashMap<ColumnIdentifier, CQL3Type>();
         public final CFPropDefs properties = new CFPropDefs();
 
         private final List<List<ColumnIdentifier>> keyAliases = new ArrayList<List<ColumnIdentifier>>();
         private final List<ColumnIdentifier> columnAliases = new ArrayList<ColumnIdentifier>();
-        private final Map<ColumnIdentifier, Boolean> definedOrdering = new HashMap<ColumnIdentifier, Boolean>();
+        private final Map<ColumnIdentifier, Boolean> definedOrdering = new LinkedHashMap<ColumnIdentifier, Boolean>(); // Insertion ordering is important
 
         private boolean useCompactStorage;
         private final Multiset<ColumnIdentifier> definedNames = HashMultiset.create(1);
@@ -169,10 +178,10 @@ public class CreateColumnFamilyStatement extends SchemaAlteringStatement
             stmt.setBoundTerms(getBoundsTerms());
 
             Map<ByteBuffer, CollectionType> definedCollections = null;
-            for (Map.Entry<ColumnIdentifier, ParsedType> entry : definitions.entrySet())
+            for (Map.Entry<ColumnIdentifier, CQL3Type> entry : definitions.entrySet())
             {
                 ColumnIdentifier id = entry.getKey();
-                ParsedType pt = entry.getValue();
+                CQL3Type pt = entry.getValue();
                 if (pt.isCollection())
                 {
                     if (definedCollections == null)
@@ -206,6 +215,9 @@ public class CreateColumnFamilyStatement extends SchemaAlteringStatement
                     // There should remain some column definition since it is a non-composite "static" CF
                     if (stmt.columns.isEmpty())
                         throw new InvalidRequestException("No definition found that is not part of the PRIMARY KEY");
+
+                    if (definedCollections != null)
+                        throw new InvalidRequestException("Collection types are not supported with COMPACT STORAGE");
 
                     stmt.comparator = CFDefinition.definitionType;
                 }
@@ -264,15 +276,12 @@ public class CreateColumnFamilyStatement extends SchemaAlteringStatement
                 }
             }
 
-            if (useCompactStorage && stmt.columns.size() <= 1)
+            if (useCompactStorage && !stmt.columnAliases.isEmpty())
             {
                 if (stmt.columns.isEmpty())
                 {
-                    if (columnAliases.isEmpty())
-                        throw new InvalidRequestException(String.format("COMPACT STORAGE with non-composite PRIMARY KEY require one column not part of the PRIMARY KEY (got: %s)", StringUtils.join(stmt.columns.keySet(), ", ")));
-
                     // The only value we'll insert will be the empty one, so the default validator don't matter
-                    stmt.defaultValidator = CFDefinition.definitionType;
+                    stmt.defaultValidator = BytesType.instance;
                     // We need to distinguish between
                     //   * I'm upgrading from thrift so the valueAlias is null
                     //   * I've define my table with only a PK (and the column value will be empty)
@@ -281,6 +290,9 @@ public class CreateColumnFamilyStatement extends SchemaAlteringStatement
                 }
                 else
                 {
+                    if (stmt.columns.size() > 1)
+                        throw new InvalidRequestException(String.format("COMPACT STORAGE with composite PRIMARY KEY allows no more than one column not part of the PRIMARY KEY (got: %s)", StringUtils.join(stmt.columns.keySet(), ", ")));
+
                     Map.Entry<ColumnIdentifier, AbstractType> lastEntry = stmt.columns.entrySet().iterator().next();
                     stmt.defaultValidator = lastEntry.getValue();
                     stmt.valueAlias = lastEntry.getKey().key;
@@ -289,14 +301,38 @@ public class CreateColumnFamilyStatement extends SchemaAlteringStatement
             }
             else
             {
-                if (useCompactStorage && !columnAliases.isEmpty())
-                    throw new InvalidRequestException(String.format("COMPACT STORAGE with composite PRIMARY KEY allows no more than one column not part of the PRIMARY KEY (got: %s)", StringUtils.join(stmt.columns.keySet(), ", ")));
+                // For compact, we are in the "static" case, so we need at least one column defined. For non-compact however, having
+                // just the PK is fine since we have CQL3 row marker.
+                if (useCompactStorage && stmt.columns.isEmpty())
+                    throw new InvalidRequestException("COMPACT STORAGE with non-composite PRIMARY KEY require one column not part of the PRIMARY KEY, none given");
 
                 // There is no way to insert/access a column that is not defined for non-compact storage, so
                 // the actual validator don't matter much (except that we want to recognize counter CF as limitation apply to them).
                 stmt.defaultValidator = !stmt.columns.isEmpty() && (stmt.columns.values().iterator().next() instanceof CounterColumnType)
                     ? CounterColumnType.instance
-                    : CFDefinition.definitionType;
+                    : BytesType.instance;
+            }
+
+
+            // If we give a clustering order, we must explicitely do so for all aliases and in the order of the PK
+            if (!definedOrdering.isEmpty())
+            {
+                if (definedOrdering.size() > columnAliases.size())
+                    throw new InvalidRequestException("Too much columns provided for CLUSTERING ORDER");
+
+                int i = 0;
+                for (ColumnIdentifier id : definedOrdering.keySet())
+                {
+                    ColumnIdentifier c = columnAliases.get(i);
+                    if (!id.equals(c))
+                    {
+                        if (definedOrdering.containsKey(c))
+                            throw new InvalidRequestException(String.format("The order of columns in the CLUSTERING ORDER directive must be the one of the clustering key (%s must appear before %s)", c, id));
+                        else
+                            throw new InvalidRequestException(String.format("Missing CLUSTERING ORDER for column %s", c));
+                    }
+                    ++i;
+                }
             }
 
             return new ParsedStatement.Prepared(stmt);
@@ -314,7 +350,7 @@ public class CreateColumnFamilyStatement extends SchemaAlteringStatement
             return isReversed != null && isReversed ? ReversedType.getInstance(type) : type;
         }
 
-        public void addDefinition(ColumnIdentifier def, ParsedType type)
+        public void addDefinition(ColumnIdentifier def, CQL3Type type)
         {
             definedNames.add(def);
             definitions.put(def, type);

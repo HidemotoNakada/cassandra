@@ -105,7 +105,7 @@ public class IndexHelper
         return indexList;
     }
 
-    public static Filter defreezeBloomFilter(FileDataInput file, FilterFactory.Type type) throws IOException
+    public static IFilter defreezeBloomFilter(FileDataInput file, FilterFactory.Type type) throws IOException
     {
         return defreezeBloomFilter(file, Integer.MAX_VALUE, type);
     }
@@ -122,7 +122,7 @@ public class IndexHelper
      * Guarantees that file's current position will be just after the bloom filter, even if
      * the filter cannot be deserialized, UNLESS EOFException is thrown.
      */
-    public static Filter defreezeBloomFilter(FileDataInput file, long maxSize, FilterFactory.Type type) throws IOException
+    public static IFilter defreezeBloomFilter(FileDataInput file, long maxSize, FilterFactory.Type type) throws IOException
     {
         int size = file.readInt();
         if (size > maxSize || size <= 0)
@@ -130,7 +130,7 @@ public class IndexHelper
         ByteBuffer bytes = file.readBytes(size);
 
         DataInputStream stream = new DataInputStream(ByteBufferUtil.inputStream(bytes));
-        return FilterFactory.deserialize(stream, type);
+        return FilterFactory.deserialize(stream, type, false);
     }
 
     /**
@@ -154,6 +154,10 @@ public class IndexHelper
     {
         if (name.remaining() == 0 && reversed)
             return indexList.size() - 1;
+
+        if (lastIndex >= indexList.size())
+            return -1;
+
         IndexInfo target = new IndexInfo(name, name, 0, 0);
         /*
         Take the example from the unit test, and say your index looks like this:

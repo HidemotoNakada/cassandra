@@ -21,7 +21,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Counter;
 import com.yammer.metrics.core.Gauge;
 import com.yammer.metrics.core.Meter;
 import com.yammer.metrics.core.MetricName;
@@ -38,15 +37,17 @@ public class CacheMetrics
     public static final String TYPE_NAME = "Cache";
 
     /** Cache capacity in bytes */
-    public final Gauge<Long> capacityInBytes;
+    public final Gauge<Long> capacity;
     /** Total number of cache hits */
     public final Meter hits;
     /** Total number of cache requests */
     public final Meter requests;
     /** cache hit rate */
     public final Gauge<Double> hitRate;
-    /** Total size of cache */
+    /** Total size of cache, in bytes */
     public final Gauge<Long> size;
+    /** Total number of cache entries */
+    public final Gauge<Integer> entries;
 
     private final AtomicLong lastRequests = new AtomicLong(0);
     private final AtomicLong lastHits = new AtomicLong(0);
@@ -59,7 +60,7 @@ public class CacheMetrics
      */
     public CacheMetrics(String type, final ICache cache)
     {
-        capacityInBytes = Metrics.newGauge(new MetricName(GROUP_NAME, TYPE_NAME, "CapacityInBytes", type), new Gauge<Long>()
+        capacity = Metrics.newGauge(new MetricName(GROUP_NAME, TYPE_NAME, "Capacity", type), new Gauge<Long>()
         {
             public Long value()
             {
@@ -85,6 +86,13 @@ public class CacheMetrics
             public Long value()
             {
                 return cache.weightedSize();
+            }
+        });
+        entries = Metrics.newGauge(new MetricName(GROUP_NAME, TYPE_NAME, "Entries", type), new Gauge<Integer>()
+        {
+            public Integer value()
+            {
+                return cache.size();
             }
         });
     }

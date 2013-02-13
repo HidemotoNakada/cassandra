@@ -167,10 +167,10 @@ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor
 
         if (r instanceof TraceSessionWrapper)
         {
-            logger.debug("completed executing {}", r);
+            TraceSessionWrapper tsw = (TraceSessionWrapper) r;
             // we have to reset trace state as its presence is what denotes the current thread is tracing
             // and if left this thread might start tracing unrelated tasks
-            ((TraceSessionWrapper)r).reset();
+            tsw.reset();
         }
         
         logExceptionsAfterExecute(r, t);
@@ -180,10 +180,7 @@ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor
     protected void beforeExecute(Thread t, Runnable r)
     {
         if (r instanceof TraceSessionWrapper)
-        {
-            logger.debug("executing {}", r);
             ((TraceSessionWrapper) r).setupContext();
-        }
 
         super.beforeExecute(t, r);
     }
@@ -255,25 +252,20 @@ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor
      *
      * @param <T>
      */
-    private static class TraceSessionWrapper<T> extends FutureTask<T> implements Callable<T>
+    private static class TraceSessionWrapper<T> extends FutureTask<T>
     {
         private final TraceState state;
-        private Callable<T> callable;
-
-        // Using initializer because the ctor's provided by the FutureTask<> are all we need
-        {
-            state = Tracing.instance().get();
-        }
 
         public TraceSessionWrapper(Runnable runnable, T result)
         {
             super(runnable, result);
+            state = Tracing.instance().get();
         }
 
         public TraceSessionWrapper(Callable<T> callable)
         {
             super(callable);
-            this.callable = callable;
+            state = Tracing.instance().get();
         }
 
         private void setupContext()
@@ -284,20 +276,6 @@ public class DebuggableThreadPoolExecutor extends ThreadPoolExecutor
         private void reset()
         {
             Tracing.instance().set(null);
-        }
-
-        public T call() throws Exception
-        {
-            return callable.call();
-        }
-
-        @Override
-        public String toString()
-        {
-            return "TraceSessionWrapper{" +
-                   "state=" + state +
-                   ", callable=" + callable +
-                   '}';
         }
     }
 }

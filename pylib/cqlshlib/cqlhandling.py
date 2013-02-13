@@ -19,10 +19,14 @@
 
 import re
 import traceback
-from . import pylexotron, util
+from . import pylexotron, util, helptopics
 from cql import cqltypes
 
 Hint = pylexotron.Hint
+
+SYSTEM_KEYSPACES = ('system',)
+
+cqldocs = helptopics.CQL2HelpTopics()
 
 class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
     keywords = set((
@@ -46,6 +50,8 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
         ('max_compaction_threshold', None),
         ('replicate_on_write', None),
         ('compaction_strategy_class', 'compaction_strategy'),
+        ('default_time_to_live', None),
+        ('populate_io_cache_on_flush', None),
     )
 
     obsolete_cf_options = (
@@ -82,6 +88,13 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
         'SimpleStrategy',
         'OldNetworkTopologyStrategy',
         'NetworkTopologyStrategy'
+    )
+
+    replication_factor_strategies = (
+        'SimpleStrategy',
+        'org.apache.cassandra.locator.SimpleStrategy',
+        'OldNetworkTopologyStrategy',
+        'org.apache.cassandra.locator.OldNetworkTopologyStrategy'
     )
 
     consistency_levels = (
@@ -385,7 +398,7 @@ class CqlParsingRuleSet(pylexotron.ParsingRuleSet):
         cqlword = cqlword.strip()
         if cqlword == '':
             return cqlword
-        if cqlword[0] == "'":
+        if cqlword[0] == "'" and cqlword[-1] == "'":
             cqlword = cqlword[1:-1].replace("''", "'")
         return cqlword
 
@@ -546,7 +559,7 @@ syntax_rules += r'''
                         "FROM" cf=<columnFamilyName>
                           ("USING" "CONSISTENCY" selcl=<consistencylevel>)?
                           ("WHERE" <selectWhereClause>)?
-                          ("LIMIT" <integer>)?
+                          ("LIMIT" limit=<integer>)?
                     ;
 <selectWhereClause> ::= <relation> ("AND" <relation>)*
                       | keyname=<colname> "IN" "(" <term> ("," <term>)* ")"
@@ -736,10 +749,7 @@ def create_ks_opt_completer(ctxt, cass):
         return ['strategy_class =']
     vals = ctxt.get_binding('optval')
     stratclass = dequote_value(vals[stratopt])
-    if stratclass in ('SimpleStrategy',
-                      'org.apache.cassandra.locator.SimpleStrategy',
-                      'OldNetworkTopologyStrategy',
-                      'org.apache.cassandra.locator.OldNetworkTopologyStrategy'):
+    if stratclass in CqlRuleSet.replication_factor_strategies:
         return ['strategy_options:replication_factor =']
     return [Hint('<strategy_option_name>')]
 
@@ -824,9 +834,9 @@ def create_cf_option_val_completer(ctxt, cass):
         return cqltypes.cql_types
     if this_opt == 'read_repair_chance':
         return [Hint('<float_between_0_and_1>')]
-    if this_opt == 'replicate_on_write':
+    if this_opt in ('replicate_on_write', 'populate_io_cache_on_flush'):
         return [Hint('<yes_or_no>')]
-    if this_opt in ('min_compaction_threshold', 'max_compaction_threshold', 'gc_grace_seconds'):
+    if this_opt in ('min_compaction_threshold', 'max_compaction_threshold', 'gc_grace_seconds', 'default_time_to_live'):
         return [Hint('<integer>')]
     return [Hint('<option_value>')]
 

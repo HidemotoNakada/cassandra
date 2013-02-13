@@ -75,13 +75,6 @@ public class BootStrapperTest extends SchemaLoader
             InetAddress.getByName("127.0.0.14"),
             InetAddress.getByName("127.0.0.15"),
         };
-        UUID[] bootstrapHostIds = new UUID[]
-        {
-            UUID.randomUUID(),
-            UUID.randomUUID(),
-            UUID.randomUUID(),
-            UUID.randomUUID(),
-        };
         Map<InetAddress, Double> load = new HashMap<InetAddress, Double>();
         for (int i = 0; i < addrs.length; i++)
         {
@@ -222,17 +215,6 @@ public class BootStrapperTest extends SchemaLoader
         assert toFetch.iterator().next().getValue().size() > 0;
         assert !toFetch.iterator().next().getKey().equals(myEndpoint);
         return s;
-    }
-
-    @Test
-    public void testException() throws UnknownHostException
-    {
-        String table = Schema.instance.getNonSystemTables().iterator().next();
-        int replicationFactor = Table.open(table).getReplicationStrategy().getReplicationFactor();
-        RangeStreamer streamer = testSourceTargetComputation(table, replicationFactor, replicationFactor);
-        streamer.latch = new CountDownLatch(4);
-        streamer.convict(streamer.toFetch().get(table).iterator().next().getKey(), Double.MAX_VALUE);
-        assertNotNull("Exception message not set, test failed", streamer.exceptionMessage);
     }
 
     private void generateFakeEndpoints(int numOldNodes) throws UnknownHostException

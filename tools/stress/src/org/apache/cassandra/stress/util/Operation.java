@@ -84,7 +84,7 @@ public abstract class Operation
             int times = session.getColumnSize() / hash.length();
             int sumReminder = session.getColumnSize() % hash.length();
 
-            String value = new StringBuilder(multiplyString(hash, times)).append(hash.substring(0, sumReminder)).toString();
+            String value = multiplyString(hash, times) + hash.substring(0, sumReminder);
             values.add(ByteBuffer.wrap(value.getBytes()));
         }
 
@@ -211,7 +211,7 @@ public abstract class Operation
     protected ByteBuffer columnName(int index, boolean timeUUIDComparator)
     {
         return timeUUIDComparator
-                ? TimeUUIDType.instance.decompose(UUIDGen.makeType1UUIDFromHost(Session.getLocalAddress()))
+                ? TimeUUIDType.instance.decompose(UUIDGen.getTimeUUID())
                 : ByteBufferUtil.bytes(String.format("C%d", index));
     }
 
@@ -244,7 +244,6 @@ public abstract class Operation
     {
         return Lists.transform(queryParams, new Function<String, ByteBuffer>()
         {
-            @Override
             public ByteBuffer apply(String param)
             {
                 return ByteBufferUtil.bytes(param);
@@ -262,7 +261,7 @@ public abstract class Operation
      */
     protected static String formatCqlQuery(String query, List<String> parms)
     {
-        int marker = 0, position = 0;
+        int marker, position = 0;
         StringBuilder result = new StringBuilder();
 
         if (-1 == (marker = query.indexOf('?')) || parms.size() == 0)

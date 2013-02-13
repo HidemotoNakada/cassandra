@@ -19,25 +19,15 @@ package org.apache.cassandra.io.util;
 
 import sun.misc.Unsafe;
 
-import java.lang.reflect.Field;
+import org.apache.cassandra.config.DatabaseDescriptor;
 
+/**
+ * An off-heap region of memory that must be manually free'd when no longer needed.
+ */
 public class Memory
 {
-    private static final Unsafe unsafe;
-
-    static
-    {
-        try
-        {
-            Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-            field.setAccessible(true);
-            unsafe = (sun.misc.Unsafe) field.get(null);
-        }
-        catch (Exception e)
-        {
-            throw new AssertionError(e);
-        }
-    }
+    private static final Unsafe unsafe = NativeAllocator.unsafe;
+    private static final IAllocator allocator = DatabaseDescriptor.getoffHeapMemoryAllocator();
 
     protected long peer;
     // size of the memory region
@@ -46,7 +36,7 @@ public class Memory
     protected Memory(long bytes)
     {
         size = bytes;
-        peer = unsafe.allocateMemory(size);
+        peer = allocator.allocate(size);
     }
 
     public static Memory allocate(long bytes)
@@ -61,6 +51,19 @@ public class Memory
     {
         checkPosition(offset);
         unsafe.putByte(peer + offset, b);
+    }
+
+    public void setMemory(long offset, long bytes, byte b)
+    {
+        // check if the last element will fit into the memory
+        checkPosition(offset + bytes - 1);
+        unsafe.setMemory(peer + offset, bytes, b);
+    }
+
+    public void setLong(long offset, long l)
+    {
+        checkPosition(offset);
+        unsafe.putLong(peer + offset, l);
     }
 
     /**
@@ -95,6 +98,12 @@ public class Memory
         return unsafe.getByte(peer + offset);
     }
 
+    public long getLong(long offset)
+    {
+        checkPosition(offset);
+        return unsafe.getLong(peer + offset);
+    }
+
     /**
      * Transfers count bytes from Memory starting at memoryOffset to buffer starting at bufferOffset
      *
@@ -121,23 +130,33 @@ public class Memory
 
     private void checkPosition(long offset)
     {
-        if (peer == 0)
-            throw new IllegalStateException("Memory was freed");
-
-        if (offset < 0 || offset >= size)
-            throw new IndexOutOfBoundsException("Illegal offset: " + offset + ", size: " + size);
+        assert peer != 0 : "Memory was freed";
+        assert offset >= 0 && offset < size : "Illegal offset: " + offset + ", size: " + size;
     }
 
     public void free()
     {
         assert peer != 0;
-        unsafe.freeMemory(peer);
+        allocator.free(peer);
         peer = 0;
     }
 
     public long size()
     {
         return size;
+    }
+
+    @Override
+    public boolean equals(Object o)
+    {
+        if (this == o)
+            return true;
+        if (!(o instanceof Memory))
+            return false;
+        Memory b = (Memory) o;
+        if (peer == b.peer && size == b.size)
+            return true;
+        return false;
     }
 }
 

@@ -37,6 +37,7 @@ import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.LengthAvailableInputStream;
 import org.apache.cassandra.io.util.SequentialWriter;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.service.StorageService;
@@ -102,14 +103,14 @@ public class AutoSavingCache<K extends CacheKey, V> extends InstrumentingCache<K
         long start = System.currentTimeMillis();
 
         // old cache format that only saves keys
-        File path = getCachePath(cfs.table.name, cfs.columnFamily, null);
+        File path = getCachePath(cfs.table.getName(), cfs.name, null);
         if (path.exists())
         {
             DataInputStream in = null;
             try
             {
                 logger.info(String.format("reading saved cache %s", path));
-                in = new DataInputStream(new BufferedInputStream(new FileInputStream(path)));
+                in = new DataInputStream(new LengthAvailableInputStream(new BufferedInputStream(new FileInputStream(path)), path.length()));
                 Set<ByteBuffer> keys = new HashSet<ByteBuffer>();
                 while (in.available() > 0)
                 {
@@ -120,7 +121,7 @@ public class AutoSavingCache<K extends CacheKey, V> extends InstrumentingCache<K
             }
             catch (Exception e)
             {
-                logger.warn(String.format("error reading saved cache %s, keys loaded so far: %d", path.getAbsolutePath(), count), e);
+                logger.debug(String.format("harmless error reading saved cache %s fully, keys loaded so far: %d", path.getAbsolutePath(), count), e);
                 return count;
             }
             finally
@@ -130,14 +131,14 @@ public class AutoSavingCache<K extends CacheKey, V> extends InstrumentingCache<K
         }
 
         // modern format, allows both key and value (so key cache load can be purely sequential)
-        path = getCachePath(cfs.table.name, cfs.columnFamily, CURRENT_VERSION);
+        path = getCachePath(cfs.table.getName(), cfs.name, CURRENT_VERSION);
         if (path.exists())
         {
             DataInputStream in = null;
             try
             {
                 logger.info(String.format("reading saved cache %s", path));
-                in = new DataInputStream(new BufferedInputStream(new FileInputStream(path)));
+                in = new DataInputStream(new LengthAvailableInputStream(new BufferedInputStream(new FileInputStream(path)), path.length()));
                 List<Future<Pair<K, V>>> futures = new ArrayList<Future<Pair<K, V>>>();
                 while (in.available() > 0)
                 {
@@ -157,7 +158,7 @@ public class AutoSavingCache<K extends CacheKey, V> extends InstrumentingCache<K
             }
             catch (Exception e)
             {
-                logger.warn(String.format("error reading saved cache %s", path.getAbsolutePath()), e);
+                logger.debug(String.format("harmless error reading saved cache %s", path.getAbsolutePath()), e);
             }
             finally
             {

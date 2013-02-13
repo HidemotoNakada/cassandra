@@ -18,51 +18,26 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import java.nio.ByteBuffer;
-import java.util.List;
+import java.util.Set;
 
+import org.apache.cassandra.auth.IResource;
 import org.apache.cassandra.auth.Permission;
-import org.apache.cassandra.cql3.CFName;
-import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.UnauthorizedException;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
-public class RevokeStatement extends ParsedStatement implements CQLStatement
+public class RevokeStatement extends PermissionAlteringStatement
 {
-    private final Permission permission;
-    private final String from;
-    private final CFName resource;
-
-    public RevokeStatement(Permission permission, String from, CFName resource)
+    public RevokeStatement(Set<Permission> permissions, IResource resource, String username)
     {
-        this.permission = permission;
-        this.from = from;
-        this.resource = resource;
+        super(permissions, resource, username);
     }
 
-    public int getBoundsTerms()
+    public ResultMessage execute(ClientState state) throws UnauthorizedException, InvalidRequestException
     {
-        return 0;
-    }
-
-    public void checkAccess(ClientState state) throws InvalidRequestException
-    {
-    }
-
-    public void validate(ClientState state) throws InvalidRequestException
-    {
-    }
-
-    public ResultMessage execute(ClientState state, List<ByteBuffer> variables) throws UnauthorizedException, InvalidRequestException
-    {
-        state.revokePermission(permission, from, resource);
+        DatabaseDescriptor.getAuthorizer().revoke(state.getUser(), permissions, resource, username);
         return null;
-    }
-
-    public Prepared prepare() throws InvalidRequestException
-    {
-        return new Prepared(this);
     }
 }

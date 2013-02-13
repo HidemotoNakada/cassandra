@@ -17,16 +17,19 @@
  */
 package org.apache.cassandra.service;
 
-import java.io.*;
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
-import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import java.lang.management.ManagementFactory;
+import java.lang.management.RuntimeMXBean;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,13 +37,12 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.exceptions.AlreadyExistsException;
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.config.KSMetaData;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.filter.QueryPath;
+import org.apache.cassandra.exceptions.AlreadyExistsException;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.*;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.net.MessageOut;
@@ -48,12 +50,33 @@ import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.UUIDGen;
+import org.apache.cassandra.utils.WrappedRunnable;
 
 public class MigrationManager implements IEndpointStateChangeSubscriber
 {
     private static final Logger logger = LoggerFactory.getLogger(MigrationManager.class);
 
     private static final ByteBuffer LAST_MIGRATION_KEY = ByteBufferUtil.bytes("Last Migration");
+
+    public static final MigrationManager instance = new MigrationManager();
+
+    private static final RuntimeMXBean runtimeMXBean = ManagementFactory.getRuntimeMXBean();
+
+    public static final int MIGRATION_DELAY_IN_MS = 60000;
+
+    private final List<IMigrationListener> listeners = new CopyOnWriteArrayList<IMigrationListener>();
+
+    private MigrationManager() {}
+
+    public void register(IMigrationListener listener)
+    {
+        listeners.add(listener);
+    }
+
+    public void unregister(IMigrationListener listener)
+    {
+        listeners.remove(listener);
+    }
 
     public void onJoin(InetAddress endpoint, EndpointState epState)
     {}
@@ -63,7 +86,7 @@ public class MigrationManager implements IEndpointStateChangeSubscriber
         if (state != ApplicationState.SCHEMA || endpoint.equals(FBUtilities.getBroadcastAddress()))
             return;
 
-        rectifySchema(UUID.fromString(value.value), endpoint);
+        maybeScheduleSchemaPull(UUID.fromString(value.value), endpoint);
     }
 
     public void onAlive(InetAddress endpoint, EndpointState state)
@@ -71,7 +94,7 @@ public class MigrationManager implements IEndpointStateChangeSubscriber
         VersionedValue value = state.getApplicationState(ApplicationState.SCHEMA);
 
         if (value != null)
-            rectifySchema(UUID.fromString(value.value), endpoint);
+            maybeScheduleSchemaPull(UUID.fromString(value.value), endpoint);
     }
 
     public void onDead(InetAddress endpoint, EndpointState state)
@@ -83,19 +106,48 @@ public class MigrationManager implements IEndpointStateChangeSubscriber
     public void onRemove(InetAddress endpoint)
     {}
 
-    private static void rectifySchema(UUID theirVersion, final InetAddress endpoint)
+    /**
+     * If versions differ this node sends request with local migration list to the endpoint
+     * and expecting to receive a list of migrations to apply locally.
+     */
+    private static void maybeScheduleSchemaPull(final UUID theirVersion, final InetAddress endpoint)
     {
-        // Can't request migrations from nodes with versions younger than 1.1
-        if (MessagingService.instance().getVersion(endpoint) < MessagingService.VERSION_11)
+        // Can't request migrations from nodes with versions younger than 1.1.7
+        if (MessagingService.instance().getVersion(endpoint) < MessagingService.VERSION_117)
             return;
 
         if (Schema.instance.getVersion().equals(theirVersion))
             return;
 
-        /**
-         * if versions differ this node sends request with local migration list to the endpoint
-         * and expecting to receive a list of migrations to apply locally.
-         *
+        if (Schema.emptyVersion.equals(Schema.instance.getVersion()) || runtimeMXBean.getUptime() < MIGRATION_DELAY_IN_MS)
+        {
+            // If we think we may be bootstrapping or have recently started, submit MigrationTask immediately
+            submitMigrationTask(endpoint);
+        }
+        else
+        {
+            // Include a delay to make sure we have a chance to apply any changes being
+            // pushed out simultaneously. See CASSANDRA-5025
+            Runnable runnable = new Runnable()
+            {
+                public void run()
+                {
+                    // grab the latest version of the schema since it may have changed again since the initial scheduling
+                    VersionedValue value = Gossiper.instance.getEndpointStateForEndpoint(endpoint).getApplicationState(ApplicationState.SCHEMA);
+                    UUID currentVersion = UUID.fromString(value.value);
+                    if (Schema.instance.getVersion().equals(currentVersion))
+                        return;
+
+                    submitMigrationTask(endpoint);
+                }
+            };
+            StorageService.optionalTasks.schedule(runnable, MIGRATION_DELAY_IN_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private static void submitMigrationTask(InetAddress endpoint)
+    {
+        /*
          * Do not de-ref the future because that causes distributed deadlock (CASSANDRA-3832) because we are
          * running in the gossip stage.
          */
@@ -107,11 +159,47 @@ public class MigrationManager implements IEndpointStateChangeSubscriber
         return StageManager.getStage(Stage.MIGRATION).getActiveCount() == 0;
     }
 
+    public void notifyCreateKeyspace(KSMetaData ksm)
+    {
+        for (IMigrationListener listener : listeners)
+            listener.onCreateKeyspace(ksm.name);
+    }
+
+    public void notifyCreateColumnFamily(CFMetaData cfm)
+    {
+        for (IMigrationListener listener : listeners)
+            listener.onCreateColumnFamily(cfm.ksName, cfm.cfName);
+    }
+
+    public void notifyUpdateKeyspace(KSMetaData ksm)
+    {
+        for (IMigrationListener listener : listeners)
+            listener.onUpdateKeyspace(ksm.name);
+    }
+
+    public void notifyUpdateColumnFamily(CFMetaData cfm)
+    {
+        for (IMigrationListener listener : listeners)
+            listener.onUpdateColumnFamily(cfm.ksName, cfm.cfName);
+    }
+
+    public void notifyDropKeyspace(KSMetaData ksm)
+    {
+        for (IMigrationListener listener : listeners)
+            listener.onDropKeyspace(ksm.name);
+    }
+
+    public void notifyDropColumnFamily(CFMetaData cfm)
+    {
+        for (IMigrationListener listener : listeners)
+            listener.onDropColumnFamily(cfm.ksName, cfm.cfName);
+    }
+
     public static void announceNewKeyspace(KSMetaData ksm) throws ConfigurationException
     {
         ksm.validate();
 
-        if (Schema.instance.getTableDefinition(ksm.name) != null)
+        if (Schema.instance.getKSMetaData(ksm.name) != null)
             throw new AlreadyExistsException(ksm.name);
 
         logger.info(String.format("Create new Keyspace: %s", ksm));
@@ -122,7 +210,7 @@ public class MigrationManager implements IEndpointStateChangeSubscriber
     {
         cfm.validate();
 
-        KSMetaData ksm = Schema.instance.getTableDefinition(cfm.ksName);
+        KSMetaData ksm = Schema.instance.getKSMetaData(cfm.ksName);
         if (ksm == null)
             throw new ConfigurationException(String.format("Cannot add column family '%s' to non existing keyspace '%s'.", cfm.cfName, cfm.ksName));
         else if (ksm.cfMetaData().containsKey(cfm.cfName))
@@ -151,6 +239,8 @@ public class MigrationManager implements IEndpointStateChangeSubscriber
         CFMetaData oldCfm = Schema.instance.getCFMetaData(cfm.ksName, cfm.cfName);
         if (oldCfm == null)
             throw new ConfigurationException(String.format("Cannot update non existing column family '%s' in keyspace '%s'.", cfm.cfName, cfm.ksName));
+
+        oldCfm.validateCompatility(cfm);
 
         logger.info(String.format("Update ColumnFamily '%s/%s' From %s To %s", cfm.ksName, cfm.cfName, oldCfm, cfm));
         announce(oldCfm.toSchemaUpdate(cfm, FBUtilities.timestampMicros()));
@@ -196,12 +286,11 @@ public class MigrationManager implements IEndpointStateChangeSubscriber
     // Returns a future on the local application of the schema
     private static Future<?> announce(final Collection<RowMutation> schema)
     {
-        Future<?> f = StageManager.getStage(Stage.MIGRATION).submit(new Callable<Object>()
+        Future<?> f = StageManager.getStage(Stage.MIGRATION).submit(new WrappedRunnable()
         {
-            public Object call() throws Exception
+            protected void runMayThrow() throws IOException, ConfigurationException
             {
                 DefsTable.mergeSchema(schema);
-                return null;
             }
         });
 
@@ -264,11 +353,12 @@ public class MigrationManager implements IEndpointStateChangeSubscriber
             liveEndpoints.remove(FBUtilities.getBroadcastAddress());
 
             // force migration is there are nodes around, first of all
-            // check if there are nodes with versions >= 1.1 to request migrations from,
+            // check if there are nodes with versions >= 1.1.7 to request migrations from,
             // because migration format of the nodes with versions < 1.1 is incompatible with older versions
+            // and due to broken timestamps in versions prior to 1.1.7
             for (InetAddress node : liveEndpoints)
             {
-                if (MessagingService.instance().getVersion(node) >= MessagingService.VERSION_11)
+                if (MessagingService.instance().getVersion(node) >= MessagingService.VERSION_117)
                 {
                     if (logger.isDebugEnabled())
                         logger.debug("Requesting schema from " + node);
@@ -300,7 +390,7 @@ public class MigrationManager implements IEndpointStateChangeSubscriber
         DecoratedKey dkey = StorageService.getPartitioner().decorateKey(LAST_MIGRATION_KEY);
         Table defs = Table.open(Table.SYSTEM_KS);
         ColumnFamilyStore cfStore = defs.getColumnFamilyStore(DefsTable.OLD_SCHEMA_CF);
-        QueryFilter filter = QueryFilter.getNamesFilter(dkey, new QueryPath(DefsTable.OLD_SCHEMA_CF), LAST_MIGRATION_KEY);
+        QueryFilter filter = QueryFilter.getNamesFilter(dkey, DefsTable.OLD_SCHEMA_CF, LAST_MIGRATION_KEY);
         ColumnFamily cf = cfStore.getColumnFamily(filter);
         if (cf == null || cf.getColumnNames().size() == 0)
             return null;

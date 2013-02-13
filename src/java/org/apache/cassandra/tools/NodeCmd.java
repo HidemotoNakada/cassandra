@@ -25,13 +25,17 @@ import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.text.DecimalFormat;
-import java.util.concurrent.ExecutionException;
-import java.util.Map.Entry;
 import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.ExecutionException;
 
 import com.google.common.collect.LinkedHashMultimap;
 import com.google.common.collect.Maps;
 import org.apache.commons.cli.*;
+import org.yaml.snakeyaml.Loader;
+import org.yaml.snakeyaml.TypeDescription;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.constructor.Constructor;
 
 import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutorMBean;
 import org.apache.cassandra.db.ColumnFamilyStoreMBean;
@@ -39,18 +43,15 @@ import org.apache.cassandra.db.Table;
 import org.apache.cassandra.db.compaction.CompactionManagerMBean;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
 import org.apache.cassandra.net.MessagingServiceMBean;
 import org.apache.cassandra.service.CacheServiceMBean;
+import org.apache.cassandra.service.PBSPredictionResult;
+import org.apache.cassandra.service.PBSPredictorMBean;
 import org.apache.cassandra.service.StorageProxyMBean;
 import org.apache.cassandra.utils.EstimatedHistogram;
 import org.apache.cassandra.utils.Pair;
-import org.yaml.snakeyaml.Loader;
-import org.yaml.snakeyaml.TypeDescription;
-import org.yaml.snakeyaml.Yaml;
-import org.yaml.snakeyaml.constructor.Constructor;
 
 public class NodeCmd
 {
@@ -63,6 +64,7 @@ public class NodeCmd
     private static final Pair<String, String> TOKENS_OPT = Pair.create("T", "tokens");
     private static final Pair<String, String> PRIMARY_RANGE_OPT = Pair.create("pr", "partitioner-range");
     private static final Pair<String, String> SNAPSHOT_REPAIR_OPT = Pair.create("snapshot", "with-snapshot");
+    private static final Pair<String, String> LOCAL_DC_REPAIR_OPT = Pair.create("local", "in-local-dc");
 
     private static final String DEFAULT_HOST = "127.0.0.1";
     private static final int DEFAULT_PORT = 7199;
@@ -82,6 +84,7 @@ public class NodeCmd
         options.addOption(TOKENS_OPT,   false, "display all tokens");
         options.addOption(PRIMARY_RANGE_OPT, false, "only repair the first range returned by the partitioner for the node");
         options.addOption(SNAPSHOT_REPAIR_OPT, false, "repair one node at a time using snapshots");
+        options.addOption(LOCAL_DC_REPAIR_OPT, false, "only repair against nodes in the same datacenter");
     }
 
     public NodeCmd(NodeProbe probe)
@@ -99,27 +102,32 @@ public class NodeCmd
         COMPACTIONSTATS,
         DECOMMISSION,
         DISABLEGOSSIP,
+        DISABLEHANDOFF,
         DISABLETHRIFT,
         DRAIN,
         ENABLEGOSSIP,
+        ENABLEHANDOFF,
         ENABLETHRIFT,
         FLUSH,
         GETCOMPACTIONTHRESHOLD,
         GETENDPOINTS,
         GETSSTABLES,
         GOSSIPINFO,
+        HELP,
         INFO,
         INVALIDATEKEYCACHE,
         INVALIDATEROWCACHE,
         JOIN,
         MOVE,
         NETSTATS,
+        PAUSEHANDOFF,
         PROXYHISTOGRAMS,
         REBUILD,
         REFRESH,
         REMOVETOKEN,
         REMOVENODE,
         REPAIR,
+        RESUMEHANDOFF,
         RING,
         SCRUB,
         SETCACHECAPACITY,
@@ -137,7 +145,8 @@ public class NodeCmd
         DESCRIBERING,
         RANGEKEYSAMPLE,
         REBUILD_INDEX,
-        RESETLOCALSCHEMA
+        RESETLOCALSCHEMA,
+        PREDICTCONSISTENCY
     }
 
 
@@ -209,7 +218,7 @@ public class NodeCmd
             ownerships = probe.effectiveOwnership(keyspace);
             keyspaceSelected = true;
         }
-        catch (ConfigurationException ex)
+        catch (IllegalStateException ex)
         {
             ownerships = probe.getOwnership();
             outs.printf("Note: Ownership information does not include topology; for complete information, specify a keyspace%n");
@@ -427,7 +436,7 @@ public class NodeCmd
                 ownerships = probe.effectiveOwnership(kSpace);
                 hasEffectiveOwns = true;
             }
-            catch (ConfigurationException e)
+            catch (IllegalStateException e)
             {
                 ownerships = probe.getOwnership();
             }
@@ -739,7 +748,12 @@ public class NodeCmd
             // print out column family statistics for this table
             for (ColumnFamilyStoreMBean cfstore : columnFamilies)
             {
-                outs.println("\t\tColumn Family: " + cfstore.getColumnFamilyName());
+                String cfName = cfstore.getColumnFamilyName();
+                if(cfName.contains("."))
+                    outs.println("\t\tColumn Family (index): " + cfName);
+                else
+                    outs.println("\t\tColumn Family: " + cfName);
+
                 outs.println("\t\tSSTable count: " + cfstore.getLiveSSTableCount());
                 int[] leveledSStables = cfstore.getSSTableCountPerLevel();
                 if (leveledSStables != null)
@@ -866,6 +880,48 @@ public class NodeCmd
         outs.println(probe.isThriftServerRunning() ? "running" : "not running");
     }
 
+    public void predictConsistency(Integer replicationFactor,
+                                   Integer timeAfterWrite,
+                                   Integer numVersions,
+                                   Float percentileLatency,
+                                   PrintStream output)
+    {
+        PBSPredictorMBean predictorMBean = probe.getPBSPredictorMBean();
+
+        for(int r = 1; r <= replicationFactor; ++r) {
+            for(int w = 1; w <= replicationFactor; ++w) {
+                if(w+r > replicationFactor+1)
+                    continue;
+
+                try {
+                    PBSPredictionResult result = predictorMBean.doPrediction(replicationFactor,
+                                                                             r,
+                                                                             w,
+                                                                             timeAfterWrite,
+                                                                             numVersions,
+                                                                             percentileLatency);
+
+                    if(r == 1 && w == 1) {
+                        output.printf("%dms after a given write, with maximum version staleness of k=%d%n", timeAfterWrite, numVersions);
+                    }
+
+                    output.printf("N=%d, R=%d, W=%d%n", replicationFactor, r, w);
+                    output.printf("Probability of consistent reads: %f%n", result.getConsistencyProbability());
+                    output.printf("Average read latency: %fms (%.3fth %%ile %dms)%n", result.getAverageReadLatency(),
+                                                                                   result.getPercentileReadLatencyPercentile()*100,
+                                                                                   result.getPercentileReadLatencyValue());
+                    output.printf("Average write latency: %fms (%.3fth %%ile %dms)%n%n", result.getAverageWriteLatency(),
+                                                                                      result.getPercentileWriteLatencyPercentile()*100,
+                                                                                      result.getPercentileWriteLatencyValue());
+                } catch (Exception e) {
+                        System.out.println(e.getMessage());
+                        e.printStackTrace();
+                        return;
+                }
+            }
+        }
+    }
+
     public static void main(String[] args) throws IOException, InterruptedException, ConfigurationException, ParseException
     {
         CommandLineParser parser = new PosixParser();
@@ -946,6 +1002,7 @@ public class NodeCmd
 
             switch (command)
             {
+                case HELP : printUsage(); break;
                 case RING :
                     if (arguments.length > 0) { nodeCmd.printRing(System.out, arguments[0]); }
                     else                      { nodeCmd.printRing(System.out, null); };
@@ -958,6 +1015,10 @@ public class NodeCmd
                 case COMPACTIONSTATS : nodeCmd.printCompactionStats(System.out); break;
                 case DISABLEGOSSIP   : probe.stopGossiping(); break;
                 case ENABLEGOSSIP    : probe.startGossiping(); break;
+                case DISABLEHANDOFF  : probe.disableHintedHandoff(); break;
+                case ENABLEHANDOFF   : probe.enableHintedHandoff(); break;
+                case PAUSEHANDOFF    : probe.pauseHintsDelivery(); break;
+                case RESUMEHANDOFF   : probe.resumeHintsDelivery(); break;
                 case DISABLETHRIFT   : probe.stopThriftServer(); break;
                 case ENABLETHRIFT    : probe.startThriftServer(); break;
                 case STATUSTHRIFT    : nodeCmd.printIsThriftServerRunning(System.out); break;
@@ -1134,6 +1195,20 @@ public class NodeCmd
                     nodeCmd.printRangeKeySample(System.out);
                     break;
 
+                case PREDICTCONSISTENCY:
+                    if (arguments.length < 2) { badUse("Requires replication factor and time"); }
+                    int numVersions = 1;
+                    if (arguments.length == 3) { numVersions = Integer.parseInt(arguments[2]); }
+                    float percentileLatency = .999f;
+                    if (arguments.length == 4) { percentileLatency = Float.parseFloat(arguments[3]); }
+
+                    nodeCmd.predictConsistency(Integer.parseInt(arguments[0]),
+                                               Integer.parseInt(arguments[1]),
+                                               numVersions,
+                                               percentileLatency,
+                                               System.out);
+                    break;
+
                 default :
                     throw new RuntimeException("Unreachable code.");
             }
@@ -1152,7 +1227,7 @@ public class NodeCmd
                 }
             }
         }
-        System.exit(0);
+        System.exit(probe.isFailed() ? 1 : 0);
     }
 
     private static Throwable findInnermostThrowable(Throwable ex)
@@ -1172,7 +1247,7 @@ public class NodeCmd
                 out.println("\t" + tokenRangeString);
             }
         }
-        catch (InvalidRequestException e)
+        catch (IOException e)
         {
             err(e, e.getMessage());
         }
@@ -1270,10 +1345,9 @@ public class NodeCmd
             {
                 case REPAIR  :
                     boolean snapshot = cmd.hasOption(SNAPSHOT_REPAIR_OPT.left);
-                    if (cmd.hasOption(PRIMARY_RANGE_OPT.left))
-                        probe.forceTableRepairPrimaryRange(keyspace, snapshot, columnFamilies);
-                    else
-                        probe.forceTableRepair(keyspace, snapshot, columnFamilies);
+                    boolean localDC = cmd.hasOption(LOCAL_DC_REPAIR_OPT.left);
+                    boolean primaryRange = cmd.hasOption(PRIMARY_RANGE_OPT.left);
+                    probe.forceRepairAsync(System.out, keyspace, snapshot, localDC, primaryRange, columnFamilies);
                     break;
                 case FLUSH   :
                     try { probe.forceTableFlush(keyspace, columnFamilies); }
@@ -1374,8 +1448,13 @@ public class NodeCmd
             String[] toReturn = new String[params.size() - 1];
 
             for (int i = 1; i < params.size(); i++)
-                toReturn[i - 1] = (String) params.get(i);
-
+            {
+                String parm = (String) params.get(i);
+                // why? look at CASSANDRA-4808
+                if (parm.startsWith("\\"))
+                    parm = parm.substring(1);
+                toReturn[i - 1] = parm;
+            }
             return toReturn;
         }
     }

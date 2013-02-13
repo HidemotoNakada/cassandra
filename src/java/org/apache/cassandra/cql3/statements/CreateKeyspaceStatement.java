@@ -17,13 +17,9 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-import java.util.HashMap;
-import java.util.Map;
-
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.KSMetaData;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.cql3.KSPropDefs;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -34,6 +30,7 @@ import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.MigrationManager;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.thrift.ThriftValidation;
+import org.apache.cassandra.transport.messages.ResultMessage;
 
 /** A <code>CREATE KEYSPACE</code> statement parsed from a CQL query. */
 public class CreateKeyspaceStatement extends SchemaAlteringStatement
@@ -55,9 +52,15 @@ public class CreateKeyspaceStatement extends SchemaAlteringStatement
         this.attrs = attrs;
     }
 
+    @Override
+    public String keyspace()
+    {
+        return name;
+    }
+
     public void checkAccess(ClientState state) throws UnauthorizedException, InvalidRequestException
     {
-        state.hasKeyspaceAccess(name, Permission.CREATE);
+        state.hasAllKeyspacesAccess(Permission.CREATE);
     }
 
     /**
@@ -95,5 +98,10 @@ public class CreateKeyspaceStatement extends SchemaAlteringStatement
     public void announceMigration() throws RequestValidationException
     {
         MigrationManager.announceNewKeyspace(attrs.asKSMetadata(name));
+    }
+
+    public ResultMessage.SchemaChange.Change changeType()
+    {
+        return ResultMessage.SchemaChange.Change.CREATED;
     }
 }

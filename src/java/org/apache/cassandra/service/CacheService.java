@@ -48,7 +48,6 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.RowIndexEntry;
 import org.apache.cassandra.db.filter.QueryFilter;
-import org.apache.cassandra.db.filter.QueryPath;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableReader;
 import org.apache.cassandra.io.sstable.SSTableReader.Operator;
@@ -242,7 +241,7 @@ public class CacheService implements CacheServiceMBean
 
     public long getRowCacheCapacityInBytes()
     {
-        return rowCache.getMetrics().capacityInBytes.value();
+        return rowCache.getMetrics().capacity.value();
     }
 
     public long getRowCacheCapacityInMB()
@@ -260,7 +259,7 @@ public class CacheService implements CacheServiceMBean
 
     public long getKeyCacheCapacityInBytes()
     {
-        return keyCache.getMetrics().capacityInBytes.value();
+        return keyCache.getMetrics().capacity.value();
     }
 
     public long getKeyCacheCapacityInMB()
@@ -282,9 +281,19 @@ public class CacheService implements CacheServiceMBean
         return rowCache.getMetrics().size.value();
     }
 
+    public long getRowCacheEntries()
+    {
+        return rowCache.size();
+    }
+
     public long getKeyCacheSize()
     {
         return keyCache.getMetrics().size.value();
+    }
+
+    public long getKeyCacheEntries()
+    {
+        return keyCache.size();
     }
 
     public void reduceCacheSizes()
@@ -330,7 +339,7 @@ public class CacheService implements CacheServiceMBean
                 public Pair<RowCacheKey, IRowCacheEntry> call() throws Exception
                 {
                     DecoratedKey key = cfs.partitioner.decorateKey(buffer);
-                    ColumnFamily data = cfs.getTopLevelColumns(QueryFilter.getIdentityFilter(key, new QueryPath(cfs.columnFamily)), Integer.MIN_VALUE, true);
+                    ColumnFamily data = cfs.getTopLevelColumns(QueryFilter.getIdentityFilter(key, cfs.name), Integer.MIN_VALUE, true);
                     return Pair.create(new RowCacheKey(cfs.metadata.cfId, key), (IRowCacheEntry) data);
                 }
             });
@@ -341,7 +350,7 @@ public class CacheService implements CacheServiceMBean
             for (ByteBuffer key : buffers)
             {
                 DecoratedKey dk = cfs.partitioner.decorateKey(key);
-                ColumnFamily data = cfs.getTopLevelColumns(QueryFilter.getIdentityFilter(dk, new QueryPath(cfs.columnFamily)), Integer.MIN_VALUE, true);
+                ColumnFamily data = cfs.getTopLevelColumns(QueryFilter.getIdentityFilter(dk, cfs.name), Integer.MIN_VALUE, true);
                 rowCache.put(new RowCacheKey(cfs.metadata.cfId, dk), data);
             }
         }

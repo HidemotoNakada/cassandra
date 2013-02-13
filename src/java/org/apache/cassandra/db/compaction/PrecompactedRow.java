@@ -46,8 +46,6 @@ public class PrecompactedRow extends AbstractCompactedRow
         compactedCf = cf;
     }
 
-
-
     public static ColumnFamily removeDeletedAndOldShards(DecoratedKey key, CompactionController controller, ColumnFamily cf)
     {
         assert key != null;
@@ -61,7 +59,7 @@ public class PrecompactedRow extends AbstractCompactedRow
         Boolean shouldPurge = null;
 
         if (cf.hasIrrelevantData(controller.gcBefore))
-            shouldPurge = controller.shouldPurge(key);
+            shouldPurge = controller.shouldPurge(key, cf.maxTimestamp());
 
         // We should only gc tombstone if shouldPurge == true. But otherwise,
         // it is still ok to collect column that shadowed by their (deleted)
@@ -71,7 +69,7 @@ public class PrecompactedRow extends AbstractCompactedRow
         if (compacted != null && compacted.metadata().getDefaultValidator().isCommutative())
         {
             if (shouldPurge == null)
-                shouldPurge = controller.shouldPurge(key);
+                shouldPurge = controller.shouldPurge(key, cf.deletionInfo().maxTimestamp());
             if (shouldPurge)
                 CounterColumn.mergeAndRemoveOldShards(key, compacted, controller.gcBefore, controller.mergeShardBefore);
         }
@@ -123,7 +121,7 @@ public class PrecompactedRow extends AbstractCompactedRow
             else
             {
                 // addAll is ok even if cf is an ArrayBackedSortedColumns
-                cf.addAllWithSizeDelta(thisCF, HeapAllocator.instance, Functions.<IColumn>identity(), indexer);
+                cf.addAllWithSizeDelta(thisCF, HeapAllocator.instance, Functions.<Column>identity(), indexer);
             }
         }
         return cf;
@@ -196,4 +194,6 @@ public class PrecompactedRow extends AbstractCompactedRow
     {
         return columnIndex;
     }
+
+    public void close() { }
 }

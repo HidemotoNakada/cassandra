@@ -27,10 +27,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.collect.Iterables;
+import com.google.common.collect.SetMultimap;
 import org.apache.log4j.PropertyConfigurator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.auth.Auth;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -39,10 +41,11 @@ import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.io.FSError;
-import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.thrift.ThriftServer;
 import org.apache.cassandra.utils.CLibrary;
 import org.apache.cassandra.utils.Mx4jTool;
+import org.apache.cassandra.utils.Pair;
 
 /**
  * The <code>CassandraDaemon</code> is an abstraction for a Cassandra daemon
@@ -140,35 +143,8 @@ public class CassandraDaemon
                     {
                         if (e2 != e) // make sure FSError gets logged exactly once.
                             logger.error("Exception in thread " + t, e2);
-                        handleFSError((FSError) e2);
+                        FileUtils.handleFSError((FSError) e2);
                     }
-                }
-            }
-
-            private void handleFSError(FSError e)
-            {
-                switch (DatabaseDescriptor.getDiskFailurePolicy())
-                {
-                    case stop:
-                        logger.error("Stopping the gossiper and the RPC server");
-                        StorageService.instance.stopGossiping();
-                        StorageService.instance.stopRPCServer();
-                        break;
-                    case best_effort:
-                        // for both read and write errors mark the path as unwritable.
-                        BlacklistedDirectories.maybeMarkUnwritable(e.path);
-                        if (e instanceof FSReadError)
-                        {
-                            File directory = BlacklistedDirectories.maybeMarkUnreadable(e.path);
-                            if (directory != null)
-                                Table.removeUnreadableSSTables(directory);
-                        }
-                        break;
-                    case ignore:
-                        // already logged, so left nothing to do
-                        break;
-                    default:
-                        throw new IllegalStateException();
                 }
             }
         });
@@ -219,6 +195,9 @@ public class CassandraDaemon
             System.exit(100);
         }
 
+        // setup Authenticator and Authorizer.
+        Auth.setup();
+
         // clean up debris in the rest of the tables
         for (String table : Schema.instance.getTables())
         {
@@ -227,6 +206,13 @@ public class CassandraDaemon
                 ColumnFamilyStore.scrubDataDirectories(table, cfm.cfName);
             }
         }
+        // clean up compaction leftovers
+        SetMultimap<Pair<String, String>, Integer> unfinishedCompactions = SystemTable.getUnfinishedCompactions();
+        for (Pair<String, String> kscf : unfinishedCompactions.keySet())
+        {
+            ColumnFamilyStore.removeUnfinishedCompactionLeftovers(kscf.left, kscf.right, unfinishedCompactions.get(kscf));
+        }
+        SystemTable.discardCompactionsInProgress();
 
         // initialize keyspaces
         for (String table : Schema.instance.getTables())
@@ -346,17 +332,17 @@ public class CassandraDaemon
      */
     public void start()
     {
-        String rpcFlag = System.getProperty("cassandra.start_rpc");
-        if ((rpcFlag != null && Boolean.parseBoolean(rpcFlag)) || (rpcFlag == null && DatabaseDescriptor.startRpc()))
-            thriftServer.start();
-        else
-            logger.info("Not starting RPC server as requested. Use JMX (StorageService->startRPCServer()) to start it");
-
         String nativeFlag = System.getProperty("cassandra.start_native_transport");
         if ((nativeFlag != null && Boolean.parseBoolean(nativeFlag)) || (nativeFlag == null && DatabaseDescriptor.startNativeTransport()))
             nativeServer.start();
         else
             logger.info("Not starting native transport as requested. Use JMX (StorageService->startNativeTransport()) to start it");
+
+        String rpcFlag = System.getProperty("cassandra.start_rpc");
+        if ((rpcFlag != null && Boolean.parseBoolean(rpcFlag)) || (rpcFlag == null && DatabaseDescriptor.startRpc()))
+            thriftServer.start();
+        else
+            logger.info("Not starting RPC server as requested. Use JMX (StorageService->startRPCServer()) to start it");
     }
 
     /**

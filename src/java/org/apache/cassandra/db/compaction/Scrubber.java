@@ -86,9 +86,9 @@ public class Scrubber implements Closeable
         // If we run scrub offline, we should never purge tombstone, as we cannot know if other sstable have data that the tombstone deletes.
         this.controller = isOffline
                         ? new ScrubController(cfs)
-                        : new CompactionController(cfs, Collections.singletonList(sstable), CompactionManager.getDefaultGcBefore(cfs), true);
+                        : new CompactionController(cfs, Collections.singletonList(sstable), CompactionManager.getDefaultGcBefore(cfs));
         this.isCommutative = cfs.metadata.getDefaultValidator().isCommutative();
-        this.expectedBloomFilterSize = Math.max(DatabaseDescriptor.getIndexInterval(), (int)(SSTableReader.getApproximateKeyCount(toScrub)));
+        this.expectedBloomFilterSize = Math.max(cfs.metadata.getIndexInterval(), (int)(SSTableReader.getApproximateKeyCount(toScrub,cfs.metadata)));
 
         // loop through each row, deserializing to check for damage.
         // we'll also loop through the index at the same time, using the position from the index to recover if the
@@ -262,6 +262,10 @@ public class Scrubber implements Closeable
                 writer.abort();
             throw Throwables.propagate(t);
         }
+        finally
+        {
+            controller.close();
+        }
 
         if (!outOfOrderRows.isEmpty())
         {
@@ -345,11 +349,11 @@ public class Scrubber implements Closeable
     {
         public ScrubController(ColumnFamilyStore cfs)
         {
-            super(cfs, Integer.MAX_VALUE, DataTracker.buildIntervalTree(Collections.<SSTableReader>emptyList()));
+            super(cfs, Integer.MAX_VALUE);
         }
 
         @Override
-        public boolean shouldPurge(DecoratedKey key)
+        public boolean shouldPurge(DecoratedKey key, long delTimestamp)
         {
             return false;
         }

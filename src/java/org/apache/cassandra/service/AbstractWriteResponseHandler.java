@@ -21,34 +21,56 @@ import java.net.InetAddress;
 import java.util.Collection;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.base.Predicate;
+import com.google.common.collect.Iterables;
+
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.exceptions.UnavailableException;
-import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.Table;
+import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.exceptions.*;
+import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.net.IAsyncCallback;
 import org.apache.cassandra.net.MessageIn;
-import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.utils.SimpleCondition;
 
 public abstract class AbstractWriteResponseHandler implements IAsyncCallback
 {
+    private static Predicate<InetAddress> isAlive = new Predicate<InetAddress>()
+    {
+        public boolean apply(InetAddress endpoint)
+        {
+            return FailureDetector.instance.isAlive(endpoint);
+        }
+    };
+
     private final SimpleCondition condition = new SimpleCondition();
+    protected final Table table;
     protected final long startTime;
     protected final Collection<InetAddress> naturalEndpoints;
     protected final ConsistencyLevel consistencyLevel;
     protected final Runnable callback;
     protected final Collection<InetAddress> pendingEndpoints;
+    private final WriteType writeType;
 
     /**
      * @param pendingEndpoints
      * @param callback A callback to be called when the write is successful.
      */
-    protected AbstractWriteResponseHandler(Collection<InetAddress> naturalEndpoints, Collection<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, Runnable callback)
+    protected AbstractWriteResponseHandler(Table table,
+                                           Collection<InetAddress> naturalEndpoints,
+                                           Collection<InetAddress> pendingEndpoints,
+                                           ConsistencyLevel consistencyLevel,
+                                           Runnable callback,
+                                           WriteType writeType)
     {
+        this.table = table;
         this.pendingEndpoints = pendingEndpoints;
-        startTime = System.currentTimeMillis();
+        this.startTime = System.currentTimeMillis();
         this.consistencyLevel = consistencyLevel;
         this.naturalEndpoints = naturalEndpoints;
         this.callback = callback;
+        this.writeType = writeType;
     }
 
     public void get() throws WriteTimeoutException
@@ -66,22 +88,18 @@ public abstract class AbstractWriteResponseHandler implements IAsyncCallback
         }
 
         if (!success)
-            throw new WriteTimeoutException(consistencyLevel, ackCount(), blockFor(), false);
+            throw new WriteTimeoutException(writeType, consistencyLevel, ackCount(), consistencyLevel.blockFor(table) + pendingEndpoints.size());
     }
 
     protected abstract int ackCount();
 
-    protected int blockFor()
-    {
-        return blockForCL() + pendingEndpoints.size();
-    }
-
-    protected abstract int blockForCL();
-
     /** null message means "response from local write" */
     public abstract void response(MessageIn msg);
 
-    public abstract void assureSufficientLiveNodes() throws UnavailableException;
+    public void assureSufficientLiveNodes() throws UnavailableException
+    {
+        consistencyLevel.assureSufficientLiveNodes(table, Iterables.filter(Iterables.concat(naturalEndpoints, pendingEndpoints), isAlive));
+    }
 
     protected void signal()
     {

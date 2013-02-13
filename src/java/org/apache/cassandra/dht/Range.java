@@ -355,6 +355,16 @@ public class Range<T extends RingPosition> extends AbstractBounds<T> implements 
         return "(" + left + "," + right + "]";
     }
 
+    protected String getOpeningString()
+    {
+        return "(";
+    }
+
+    protected String getClosingString()
+    {
+        return "]";
+    }
+
     public List<String> asList()
     {
         ArrayList<String> ret = new ArrayList<String>(2);
@@ -457,5 +467,10 @@ public class Range<T extends RingPosition> extends AbstractBounds<T> implements 
     public AbstractBounds<Token> toTokenBounds()
     {
         return (left instanceof RowPosition) ? new Range<Token>(((RowPosition)left).getToken(), ((RowPosition)right).getToken(), partitioner) : (Range<Token>)this;
+    }
+
+    public AbstractBounds<T> withNewRight(T newRight)
+    {
+        return new Range<T>(left, newRight);
     }
 }

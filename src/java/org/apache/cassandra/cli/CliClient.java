@@ -30,6 +30,7 @@ import java.util.*;
 import com.google.common.base.Charsets;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Collections2;
+import com.google.common.collect.Iterables;
 import org.apache.commons.lang.StringUtils;
 
 import org.antlr.runtime.tree.Tree;
@@ -71,6 +72,7 @@ public class CliClient
         TIMEUUID      (TimeUUIDType.instance),
         UTF8          (UTF8Type.instance),
         ASCII         (AsciiType.instance),
+        DOUBLE        (DoubleType.instance),
         COUNTERCOLUMN (CounterColumnType.instance);
 
         private AbstractType<?> validator;
@@ -135,7 +137,12 @@ public class CliClient
         COMPACTION_STRATEGY_OPTIONS,
         COMPRESSION_OPTIONS,
         BLOOM_FILTER_FP_CHANCE,
-        CACHING
+        INDEX_INTERVAL,
+        MEMTABLE_FLUSH_PERIOD_IN_MS,
+        CACHING,
+        DEFAULT_TIME_TO_LIVE,
+        SPECULATIVE_RETRY,
+        POPULATE_IO_CACHE_ON_FLUSH
     }
 
     private static final String DEFAULT_PLACEMENT_STRATEGY = "org.apache.cassandra.locator.NetworkTopologyStrategy";
@@ -147,6 +154,7 @@ public class CliClient
     private String keySpace = null;
     private String username = null;
     private final Map<String, KsDef> keyspacesMap = new HashMap<String, KsDef>();
+    private final Map<String, Map<String, CfDef>> cql3KeyspacesMap = new HashMap<String, Map<String, CfDef>>();
     private final Map<String, AbstractType<?>> cfKeysComparators;
     private ConsistencyLevel consistencyLevel = ConsistencyLevel.ONE;
     private final CfAssumptions assumptions = new CfAssumptions();
@@ -316,11 +324,70 @@ public class CliClient
         // Lazily lookup keyspace meta-data.
         if (!(keyspacesMap.containsKey(keyspace)))
         {
-            keyspacesMap.put(keyspace, thriftClient.describe_keyspace(keyspace));
+            KsDef ksDef = thriftClient.describe_keyspace(keyspace);
+            keyspacesMap.put(keyspace, ksDef);
+            cql3KeyspacesMap.put(keyspace, loadCql3Defs(thriftClient, ksDef));
             assumptions.replayAssumptions(keyspace);
         }
 
         return keyspacesMap.get(keyspace);
+    }
+
+    public static Map<String, CfDef> loadCql3Defs(Cassandra.Client thriftClient, KsDef thriftKs)
+    {
+        try
+        {
+            return loadCql3DefsUnchecked(thriftClient, thriftKs);
+        }
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static Map<String, CfDef> loadCql3DefsUnchecked(Cassandra.Client thriftClient, KsDef thriftKs) throws Exception
+    {
+        Map<String, CfDef> cql3Defs = new HashMap<String, CfDef>();
+
+        String query = "SELECT columnfamily_name, comparator, default_validator, key_validator FROM system.schema_columnfamilies WHERE keyspace_name='%s'";
+        String formatted = String.format(query, thriftKs.name);
+        CqlResult result = thriftClient.execute_cql3_query(ByteBufferUtil.bytes(formatted),
+                                                           Compression.NONE,
+                                                           ConsistencyLevel.ONE);
+        outer:
+        for (CqlRow row : result.rows)
+        {
+            Column rawName = row.columns.get(0);
+            assert ByteBufferUtil.string(ByteBuffer.wrap(rawName.getName())).equals("columnfamily_name");
+            String name = ByteBufferUtil.string(ByteBuffer.wrap(rawName.getValue()));
+
+            Column rawComparator = row.columns.get(1);
+            assert ByteBufferUtil.string(ByteBuffer.wrap(rawComparator.getName())).equals("comparator");
+            String comparator = ByteBufferUtil.string(ByteBuffer.wrap(rawComparator.getValue()));
+
+            Column rawValidator = row.columns.get(2);
+            assert ByteBufferUtil.string(ByteBuffer.wrap(rawValidator.getName())).equals("default_validator");
+            String validator = ByteBufferUtil.string(ByteBuffer.wrap(rawValidator.getValue()));
+
+            Column rawKeyValidator = row.columns.get(3);
+            assert ByteBufferUtil.string(ByteBuffer.wrap(rawKeyValidator.getName())).equals("key_validator");
+            String keyValidator = ByteBufferUtil.string(ByteBuffer.wrap(rawKeyValidator.getValue()));
+
+            for (CfDef cf_def : thriftKs.cf_defs)
+            {
+                if (cf_def.name.equals(name))
+                    continue outer;
+            }
+
+            CfDef thriftDef = new CfDef(thriftKs.name, name)
+                              .setComparator_type(comparator)
+                              .setDefault_validation_class(validator)
+                              .setKey_validation_class(keyValidator)
+                              .setColumn_metadata(Collections.<ColumnDef>emptyList());
+            cql3Defs.put(name, thriftDef);
+        }
+
+        return cql3Defs;
     }
 
     private void executeHelp(Tree tree)
@@ -351,7 +418,7 @@ public class CliClient
 
         Tree columnFamilySpec = statement.getChild(0);
 
-        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, keyspacesMap.get(keySpace).cf_defs);
+        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, currentCfDefs());
         int columnSpecCnt = CliCompiler.numColumnSpecifiers(columnFamilySpec);
 
         ColumnParent colParent = new ColumnParent(columnFamily).setSuper_column((ByteBuffer) null);
@@ -374,6 +441,11 @@ public class CliClient
         sessionState.out.printf("%d columns%n", count);
     }
 
+    private Iterable<CfDef> currentCfDefs()
+    {
+        return Iterables.concat(keyspacesMap.get(keySpace).cf_defs, cql3KeyspacesMap.get(keySpace).values());
+    }
+
     private void executeDelete(Tree statement)
             throws TException, InvalidRequestException, UnavailableException, TimedOutException
     {
@@ -382,7 +454,7 @@ public class CliClient
 
         Tree columnFamilySpec = statement.getChild(0);
 
-        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, keyspacesMap.get(keySpace).cf_defs);
+        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, currentCfDefs());
         CfDef cfDef = getCfDef(columnFamily);
 
         ByteBuffer key = getKeyAsBytes(columnFamily, columnFamilySpec.getChild(1));
@@ -398,7 +470,7 @@ public class CliClient
             return;
         }
 
-        long startTime = System.currentTimeMillis();
+        long startTime = System.nanoTime();
 
         Tree columnTree = (columnSpecCnt >= 1)
                            ? columnFamilySpec.getChild(2)
@@ -460,7 +532,7 @@ public class CliClient
             throws InvalidRequestException, UnavailableException, TimedOutException, TException, IllegalAccessException, NotFoundException, InstantiationException, NoSuchFieldException
     {
 
-        long startTime = System.currentTimeMillis();
+        long startTime = System.nanoTime();
         ColumnParent parent = new ColumnParent(columnFamily);
         if(superColumnName != null)
             parent.setSuper_column(superColumnName);
@@ -564,9 +636,9 @@ public class CliClient
     {
         if (!CliMain.isConnected() || !hasKeySpace())
             return;
-        long startTime = System.currentTimeMillis();
+        long startTime = System.nanoTime();
         Tree columnFamilySpec = statement.getChild(0);
-        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, keyspacesMap.get(keySpace).cf_defs);
+        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, currentCfDefs());
         ByteBuffer key = getKeyAsBytes(columnFamily, columnFamilySpec.getChild(1));
         int columnSpecCnt = CliCompiler.numColumnSpecifiers(columnFamilySpec);
         CfDef cfDef = getCfDef(columnFamily);
@@ -733,10 +805,10 @@ public class CliClient
         if (!CliMain.isConnected() || !hasKeySpace())
             return;
 
-        long startTime = System.currentTimeMillis();
+        long startTime = System.nanoTime();
 
         IndexClause clause = new IndexClause();
-        String columnFamily = CliCompiler.getColumnFamily(statement, keyspacesMap.get(keySpace).cf_defs);
+        String columnFamily = CliCompiler.getColumnFamily(statement, currentCfDefs());
         // ^(CONDITIONS ^(CONDITION $column $value) ...)
         Tree conditions = statement.getChild(1);
 
@@ -827,12 +899,12 @@ public class CliClient
         if (!CliMain.isConnected() || !hasKeySpace())
             return;
 
-        long startTime = System.currentTimeMillis();
+        long startTime = System.nanoTime();
         // ^(NODE_COLUMN_ACCESS <cf> <key> <column>)
         Tree columnFamilySpec = statement.getChild(0);
         Tree keyTree = columnFamilySpec.getChild(1); // could be a function or regular text
 
-        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, keyspacesMap.get(keySpace).cf_defs);
+        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, currentCfDefs());
         CfDef cfDef = getCfDef(columnFamily);
         int columnSpecCnt = CliCompiler.numColumnSpecifiers(columnFamilySpec);
         String value = CliUtils.unescapeSQLString(statement.getChild(1).getText());
@@ -919,7 +991,7 @@ public class CliClient
 
         Tree columnFamilySpec = statement.getChild(0);
 
-        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, keyspacesMap.get(keySpace).cf_defs);
+        String columnFamily = CliCompiler.getColumnFamily(columnFamilySpec, currentCfDefs());
         ByteBuffer key = getKeyAsBytes(columnFamily, columnFamilySpec.getChild(1));
         int columnSpecCnt = CliCompiler.numColumnSpecifiers(columnFamilySpec);
 
@@ -1085,7 +1157,7 @@ public class CliClient
         if (!CliMain.isConnected() || !hasKeySpace())
             return;
 
-        String cfName = CliCompiler.getColumnFamily(statement, keyspacesMap.get(keySpace).cf_defs);
+        String cfName = CliCompiler.getColumnFamily(statement, currentCfDefs());
 
         try
         {
@@ -1256,8 +1328,22 @@ public class CliClient
             case BLOOM_FILTER_FP_CHANCE:
                 cfDef.setBloom_filter_fp_chance(Double.parseDouble(mValue));
                 break;
+            case MEMTABLE_FLUSH_PERIOD_IN_MS:
+                cfDef.setMemtable_flush_period_in_ms(Integer.parseInt(mValue));
+                break;
             case CACHING:
                 cfDef.setCaching(CliUtils.unescapeSQLString(mValue));
+                break;
+            case DEFAULT_TIME_TO_LIVE:
+                cfDef.setDefault_time_to_live(Integer.parseInt(mValue));
+                break;
+            case INDEX_INTERVAL:
+                cfDef.setIndex_interval(Integer.parseInt(mValue));
+                break;
+            case SPECULATIVE_RETRY:
+                cfDef.setSpeculative_retry(CliUtils.unescapeSQLString(mValue));
+            case POPULATE_IO_CACHE_ON_FLUSH:
+                cfDef.setPopulate_io_cache_on_flush(Boolean.parseBoolean(mValue));
                 break;
             default:
                 //must match one of the above or we'd throw an exception at the valueOf statement above.
@@ -1305,7 +1391,7 @@ public class CliClient
         if (!CliMain.isConnected() || !hasKeySpace())
             return;
 
-        String cfName = CliCompiler.getColumnFamily(statement, keyspacesMap.get(keySpace).cf_defs);
+        String cfName = CliCompiler.getColumnFamily(statement, currentCfDefs());
         String mySchemaVersion = thriftClient.system_drop_column_family(cfName);
         sessionState.out.println(mySchemaVersion);
     }
@@ -1316,10 +1402,10 @@ public class CliClient
         if (!CliMain.isConnected() || !hasKeySpace())
             return;
 
-        long startTime = System.currentTimeMillis();
+        long startTime = System.nanoTime();
 
         // extract column family
-        String columnFamily = CliCompiler.getColumnFamily(statement, keyspacesMap.get(keySpace).cf_defs);
+        String columnFamily = CliCompiler.getColumnFamily(statement, currentCfDefs());
 
         String rawStartKey = "";
         String rawEndKey = "";
@@ -1427,7 +1513,7 @@ public class CliClient
             return;
 
         // getColumnFamily will check if CF exists for us
-        String columnFamily = CliCompiler.getColumnFamily(statement, keyspacesMap.get(keySpace).cf_defs);
+        String columnFamily = CliCompiler.getColumnFamily(statement, currentCfDefs());
         String rawColumName = CliUtils.unescapeSQLString(statement.getChild(1).getText());
 
         CfDef cfDef = getCfDef(columnFamily);
@@ -1467,7 +1553,7 @@ public class CliClient
             return;
 
         // getting CfDef, it will fail if there is no such column family in current keySpace.
-        CfDef cfDef = getCfDef(CliCompiler.getColumnFamily(columnFamily, keyspacesMap.get(keySpace).cf_defs));
+        CfDef cfDef = getCfDef(CliCompiler.getColumnFamily(columnFamily, currentCfDefs()));
 
         thriftClient.truncate(cfDef.getName());
         sessionState.out.println(columnFamily + " truncated.");
@@ -1509,7 +1595,7 @@ public class CliClient
         if (!CliMain.isConnected() || !hasKeySpace())
             return;
 
-        String cfName = CliCompiler.getColumnFamily(statement, keyspacesMap.get(keySpace).cf_defs);
+        String cfName = CliCompiler.getColumnFamily(statement, currentCfDefs());
 
         // VALIDATOR | COMPARATOR | KEYS | SUB_COMPARATOR
         String assumptionElement = statement.getChild(1).getText().toUpperCase();
@@ -1707,12 +1793,15 @@ public class CliClient
 
         writeAttr(output, false, "read_repair_chance", cfDef.read_repair_chance);
         writeAttr(output, false, "dclocal_read_repair_chance", cfDef.dclocal_read_repair_chance);
+        writeAttr(output, false, "populate_io_cache_on_flush", cfDef.populate_io_cache_on_flush);
         writeAttr(output, false, "gc_grace", cfDef.gc_grace_seconds);
         writeAttr(output, false, "min_compaction_threshold", cfDef.min_compaction_threshold);
         writeAttr(output, false, "max_compaction_threshold", cfDef.max_compaction_threshold);
         writeAttr(output, false, "replicate_on_write", cfDef.replicate_on_write);
         writeAttr(output, false, "compaction_strategy", cfDef.compaction_strategy);
         writeAttr(output, false, "caching", cfDef.caching);
+        writeAttr(output, false, "default_time_to_live", cfDef.default_time_to_live);
+        writeAttr(output, false, "speculative_retry", cfDef.speculative_retry);
 
         if (cfDef.isSetBloom_filter_fp_chance())
             writeAttr(output, false, "bloom_filter_fp_chance", cfDef.bloom_filter_fp_chance);
@@ -1785,6 +1874,8 @@ public class CliClient
 
             writeAttrRaw(output, false, "compression_options", compOptions.toString());
         }
+        if (cfDef.isSetIndex_interval())
+            writeAttr(output, false, "index_interval", cfDef.index_interval);
 
         output.append(";");
         output.append(NEWLINE);
@@ -1814,7 +1905,7 @@ public class CliClient
                   .append(TAB + TAB + "index_name : '" + CliUtils.escapeSQLString(colDef.index_name) + "'," + NEWLINE)
                   .append(TAB + TAB + "index_type : " + CliUtils.escapeSQLString(Integer.toString(colDef.index_type.getValue())));
 
-            if (colDef.index_options != null)
+            if (colDef.index_options != null && !colDef.index_options.isEmpty())
             {
                 output.append(",").append(NEWLINE);
                 output.append(TAB + TAB + "index_options : {" + NEWLINE);
@@ -2076,9 +2167,13 @@ public class CliClient
         sessionState.out.printf("      Compaction min/max thresholds: %s/%s%n", cf_def.min_compaction_threshold, cf_def.max_compaction_threshold);
         sessionState.out.printf("      Read repair chance: %s%n", cf_def.read_repair_chance);
         sessionState.out.printf("      DC Local Read repair chance: %s%n", cf_def.dclocal_read_repair_chance);
+        sessionState.out.printf("      Populate IO Cache on flush: %b%n", cf_def.populate_io_cache_on_flush);
         sessionState.out.printf("      Replicate on write: %s%n", cf_def.replicate_on_write);
         sessionState.out.printf("      Caching: %s%n", cf_def.caching);
+        sessionState.out.printf("      Default time to live: %s%n", cf_def.default_time_to_live);
         sessionState.out.printf("      Bloom Filter FP chance: %s%n", cf_def.isSetBloom_filter_fp_chance() ? cf_def.bloom_filter_fp_chance : "default");
+        sessionState.out.printf("      Index interval: %s%n", cf_def.isSetIndex_interval() ? cf_def.index_interval : "default");
+        sessionState.out.printf("      Speculative Retry: %s%n", cf_def.speculative_retry);
 
         // if we have connection to the cfMBean established
         if (cfMBean != null)
@@ -2284,17 +2379,11 @@ public class CliClient
      */
     private CfDef getCfDef(String keySpaceName, String columnFamilyName)
     {
-        KsDef keySpaceDefinition = keyspacesMap.get(keySpaceName);
-
-        for (CfDef columnFamilyDef : keySpaceDefinition.cf_defs)
-        {
-            if (columnFamilyDef.name.equals(columnFamilyName))
-            {
-                return columnFamilyDef;
-            }
-        }
-
-        throw new RuntimeException("No such column family: " + columnFamilyName);
+        KsDef ksDef = keyspacesMap.get(keySpaceName);
+        CfDef cfDef = getCfDef(ksDef, columnFamilyName);
+        if (cfDef == null)
+            throw new RuntimeException("No such column family: " + columnFamilyName);
+        return cfDef;
     }
 
     /**
@@ -2315,7 +2404,7 @@ public class CliClient
                 return cfDef;
         }
 
-        return null;
+        return cql3KeyspacesMap.get(keyspace.name).get(columnFamilyName);
     }
 
     /**
@@ -2570,15 +2659,15 @@ public class CliClient
 
     /**
      * Get validator for specific column value
-     * @param ColumnFamilyDef - CfDef object representing column family with metadata
+     * @param cfDef - CfDef object representing column family with metadata
      * @param columnNameInBytes - column name as byte array
      * @return AbstractType - validator for column value
      */
-    private AbstractType<?> getValidatorForValue(CfDef ColumnFamilyDef, byte[] columnNameInBytes)
+    private AbstractType<?> getValidatorForValue(CfDef cfDef, byte[] columnNameInBytes)
     {
-        String defaultValidator = ColumnFamilyDef.default_validation_class;
+        String defaultValidator = cfDef.default_validation_class;
 
-        for (ColumnDef columnDefinition : ColumnFamilyDef.getColumn_metadata())
+        for (ColumnDef columnDefinition : cfDef.getColumn_metadata())
         {
             byte[] nameInBytes = columnDefinition.getName();
 
@@ -2735,7 +2824,6 @@ public class CliClient
      */
     private void updateColumnMetaData(CfDef columnFamily, ByteBuffer columnName, String validationClass)
     {
-        List<ColumnDef> columnMetaData = columnFamily.getColumn_metadata();
         ColumnDef column = getColumnDefByName(columnFamily, columnName);
 
         if (column != null)
@@ -2749,7 +2837,9 @@ public class CliClient
         }
         else
         {
+            List<ColumnDef> columnMetaData = new ArrayList<ColumnDef>(columnFamily.getColumn_metadata());
             columnMetaData.add(new ColumnDef(columnName, validationClass));
+            columnFamily.setColumn_metadata(columnMetaData);
         }
     }
 
@@ -2923,16 +3013,30 @@ public class CliClient
     private boolean isCounterCF(CfDef cfdef)
     {
         String defaultValidator = cfdef.default_validation_class;
-        if (defaultValidator != null && !defaultValidator.isEmpty())
-        {
-            return (getFormatType(defaultValidator) instanceof CounterColumnType);
-        }
-        return false;
+        return defaultValidator != null
+               && !defaultValidator.isEmpty()
+               && getFormatType(defaultValidator) instanceof CounterColumnType;
     }
 
+    /**
+     * Print elapsed time. Print 2 fraction digits if eta is under 10 ms.
+     * @param startTime starting time in nanoseconds
+     */
     private void elapsedTime(long startTime)
     {
-        sessionState.out.println("Elapsed time: " + (System.currentTimeMillis() - startTime) + " msec(s).");
+        /** time elapsed in nanoseconds */
+        long eta = System.nanoTime() - startTime;
+
+        sessionState.out.print("Elapsed time: ");
+        if (eta < 10000000)
+        {
+            sessionState.out.print(Math.round(eta/10000.0)/100.0);
+        }
+        else
+        {
+            sessionState.out.print(Math.round(eta/1000000.0));
+        }
+        sessionState.out.println(" msec(s).");
     }
 
     class CfAssumptions

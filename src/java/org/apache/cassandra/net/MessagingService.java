@@ -36,18 +36,17 @@ import javax.management.ObjectName;
 
 import com.google.common.base.Function;
 import com.google.common.collect.Lists;
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.EncryptionOptions;
+import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.dht.BootStrapper;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.GossipDigestAck;
 import org.apache.cassandra.gms.GossipDigestAck2;
 import org.apache.cassandra.gms.GossipDigestSyn;
@@ -58,25 +57,24 @@ import org.apache.cassandra.metrics.ConnectionMetrics;
 import org.apache.cassandra.metrics.DroppedMessageMetrics;
 import org.apache.cassandra.net.sink.SinkManager;
 import org.apache.cassandra.security.SSLFactory;
-import org.apache.cassandra.service.AntiEntropyService;
-import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.service.StorageProxy;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.*;
 import org.apache.cassandra.streaming.*;
 import org.apache.cassandra.streaming.compress.CompressedFileStreamTask;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.*;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
 public final class MessagingService implements MessagingServiceMBean
 {
     public static final String MBEAN_NAME = "org.apache.cassandra.net:type=MessagingService";
 
     // 8 bits version, so don't waste versions
-    // We are no longer compatible with versions older than 1.0
-    public static final int VERSION_10 = 3;
-    public static final int VERSION_11 = 4;
-    public static final int VERSION_12 = 5;
-    public static final int current_version = VERSION_12;
+    public static final int VERSION_10  = 3;
+    public static final int VERSION_11  = 4;
+    public static final int VERSION_117 = 5;
+    public static final int VERSION_12  = 6;
+    public static final int VERSION_20  = 7;
+    public static final int current_version = VERSION_20;
 
     /**
      * we preface every message with this number so the recipient can validate the sender is sane
@@ -135,8 +133,8 @@ public final class MessagingService implements MessagingServiceMBean
         put(Verb.TRUNCATE, Stage.MUTATION);
         put(Verb.READ, Stage.READ);
         put(Verb.REQUEST_RESPONSE, Stage.REQUEST_RESPONSE);
-        put(Verb.STREAM_REPLY, Stage.MISC); // TODO does this really belong on misc? I've just copied old behavior here
-        put(Verb.STREAM_REQUEST, Stage.STREAM);
+        put(Verb.STREAM_REPLY, Stage.MISC); // actually handled by FileStreamTask and streamExecutors
+        put(Verb.STREAM_REQUEST, Stage.MISC);
         put(Verb.RANGE_SLICE, Stage.READ);
         put(Verb.BOOTSTRAP_TOKEN, Stage.MISC);
         put(Verb.TREE_REQUEST, Stage.ANTI_ENTROPY);
@@ -268,11 +266,12 @@ public final class MessagingService implements MessagingServiceMBean
     private final SimpleCondition listenGate;
 
     /**
-     * Verbs it's okay to drop if the request has been queued longer than RPC_TIMEOUT.  These
+     * Verbs it's okay to drop if the request has been queued longer than the request timeout.  These
      * all correspond to client requests or something triggered by them; we don't want to
      * drop internal messages like bootstrap or repair notifications.
      */
     public static final EnumSet<Verb> DROPPABLE_VERBS = EnumSet.of(Verb.BINARY,
+                                                                   Verb._TRACE,
                                                                    Verb.MUTATION,
                                                                    Verb.READ_REPAIR,
                                                                    Verb.READ,
@@ -330,7 +329,7 @@ public final class MessagingService implements MessagingServiceMBean
                 {
                     assert expiredCallbackInfo.sentMessage != null;
                     RowMutation rm = (RowMutation) expiredCallbackInfo.sentMessage.payload;
-                    return StorageProxy.scheduleLocalHint(rm, expiredCallbackInfo.target, null, null);
+                    return StorageProxy.submitHint(rm, expiredCallbackInfo.target, null, null);
                 }
 
                 return null;
@@ -398,11 +397,11 @@ public final class MessagingService implements MessagingServiceMBean
     private List<ServerSocket> getServerSocket(InetAddress localEp) throws ConfigurationException
     {
         final List<ServerSocket> ss = new ArrayList<ServerSocket>(2);
-        if (DatabaseDescriptor.getEncryptionOptions().internode_encryption != EncryptionOptions.InternodeEncryption.none)
+        if (DatabaseDescriptor.getServerEncryptionOptions().internode_encryption != ServerEncryptionOptions.InternodeEncryption.none)
         {
             try
             {
-                ss.add(SSLFactory.getServerSocket(DatabaseDescriptor.getEncryptionOptions(), localEp, DatabaseDescriptor.getSSLStoragePort()));
+                ss.add(SSLFactory.getServerSocket(DatabaseDescriptor.getServerEncryptionOptions(), localEp, DatabaseDescriptor.getSSLStoragePort()));
             }
             catch (IOException e)
             {
@@ -464,6 +463,15 @@ public final class MessagingService implements MessagingServiceMBean
         {
             logger.debug("await interrupted");
         }
+    }
+
+    public void destroyConnectionPool(InetAddress to)
+    {
+        OutboundTcpConnectionPool cp = connectionManagers.get(to);
+        if (cp == null)
+            return;
+        cp.close();
+        connectionManagers.remove(to);
     }
 
     public OutboundTcpConnectionPool getConnectionPool(InetAddress to)
@@ -555,6 +563,16 @@ public final class MessagingService implements MessagingServiceMBean
     public String sendRR(MessageOut message, InetAddress to, IMessageCallback cb, long timeout)
     {
         String id = addCallback(cb, message, to, timeout);
+
+        if (cb instanceof AbstractWriteResponseHandler)
+        {
+            PBSPredictor.instance().startWriteOperation(id);
+        }
+        else if (cb instanceof ReadCallback)
+        {
+            PBSPredictor.instance().startReadOperation(id);
+        }
+
         sendOneWay(message, id, to);
         return id;
     }
@@ -582,7 +600,7 @@ public final class MessagingService implements MessagingServiceMBean
             logger.trace(FBUtilities.getBroadcastAddress() + " sending " + message.verb + " to " + id + "@" + to);
 
         if (to.equals(FBUtilities.getBroadcastAddress()))
-            logger.debug("Message-to-self {} going over MessagingService", message);
+            logger.trace("Message-to-self {} going over MessagingService", message);
 
         // message sinks are a testing hook
         MessageOut processedMessage = SinkManager.processOutboundMessage(message, id, to);
@@ -684,9 +702,7 @@ public final class MessagingService implements MessagingServiceMBean
     public void receive(MessageIn message, String id, long timestamp)
     {
         Tracing.instance().initializeFromMessage(message);
-
-        if (logger.isTraceEnabled())
-            logger.trace(FBUtilities.getBroadcastAddress() + " received " + message.verb + " from " + id + "@" + message.from);
+        Tracing.trace("Message received from {}", message.from);
 
         message = SinkManager.processInboundMessage(message, id);
         if (message == null)
@@ -695,6 +711,21 @@ public final class MessagingService implements MessagingServiceMBean
         Runnable runnable = new MessageDeliveryTask(message, id, timestamp);
         ExecutorService stage = StageManager.getStage(message.getMessageType());
         assert stage != null : "No stage for message type " + message.verb;
+
+        if (message.verb == Verb.REQUEST_RESPONSE && PBSPredictor.instance().isLoggingEnabled())
+        {
+            IMessageCallback cb = MessagingService.instance().getRegisteredCallback(id).callback;
+
+            if (cb instanceof AbstractWriteResponseHandler)
+            {
+                PBSPredictor.instance().logWriteResponse(id, timestamp);
+            }
+            else if (cb instanceof ReadCallback)
+            {
+                PBSPredictor.instance().logReadResponse(id, timestamp);
+            }
+        }
+
         stage.execute(runnable);
     }
 

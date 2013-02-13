@@ -18,7 +18,6 @@
 package org.apache.cassandra.cache;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
 import java.util.Arrays;
 
 import org.apache.cassandra.io.sstable.Descriptor;
@@ -28,6 +27,9 @@ import org.apache.cassandra.utils.Pair;
 public class KeyCacheKey implements CacheKey
 {
     public final Descriptor desc;
+
+    // keeping an array instead of a ByteBuffer lowers the overhead of the key cache working set,
+    // without extra copies on lookup since client-provided key ByteBuffers will be array-backed already
     public final byte[] key;
 
     public KeyCacheKey(Descriptor desc, ByteBuffer key)
@@ -44,14 +46,7 @@ public class KeyCacheKey implements CacheKey
 
     public String toString()
     {
-        try
-        {
-            return String.format("KeyCacheKey(descriptor:%s, key:%s)", desc, ByteBufferUtil.string(ByteBuffer.wrap(key)));
-        }
-        catch (CharacterCodingException e)
-        {
-            throw new AssertionError(e);
-        }
+        return String.format("KeyCacheKey(%s, %s)", desc, ByteBufferUtil.bytesToHex(ByteBuffer.wrap(key)));
     }
 
     @Override

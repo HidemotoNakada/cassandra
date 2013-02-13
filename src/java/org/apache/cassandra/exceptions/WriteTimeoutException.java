@@ -17,19 +17,16 @@
  */
 package org.apache.cassandra.exceptions;
 
-import java.net.InetAddress;
-import java.util.Set;
-import java.nio.ByteBuffer;
-
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.WriteType;
 
 public class WriteTimeoutException extends RequestTimeoutException
 {
-    public final boolean writtenToBatchlog;
+    public final WriteType writeType;
 
-    public WriteTimeoutException(ConsistencyLevel consistency, int received, int blockFor, boolean writtenToBatchlog)
+    public WriteTimeoutException(WriteType writeType, ConsistencyLevel consistency, int received, int blockFor)
     {
         super(ExceptionCode.WRITE_TIMEOUT, consistency, received, blockFor);
-        this.writtenToBatchlog = writtenToBatchlog;
+        this.writeType = writeType;
     }
 }

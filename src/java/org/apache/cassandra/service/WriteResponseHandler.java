@@ -27,10 +27,12 @@ import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.Table;
 import org.apache.cassandra.exceptions.UnavailableException;
 import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.WriteType;
 
 /**
  * Handles blocking writes for ONE, ANY, TWO, THREE, QUORUM, and ALL consistency levels.
@@ -40,30 +42,26 @@ public class WriteResponseHandler extends AbstractWriteResponseHandler
     protected static final Logger logger = LoggerFactory.getLogger(WriteResponseHandler.class);
 
     protected final AtomicInteger responses;
-    private final int blockFor;
 
-    protected WriteResponseHandler(Collection<InetAddress> writeEndpoints, Collection<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table, Runnable callback)
+    public WriteResponseHandler(Collection<InetAddress> writeEndpoints,
+                                Collection<InetAddress> pendingEndpoints,
+                                ConsistencyLevel consistencyLevel,
+                                Table table,
+                                Runnable callback,
+                                WriteType writeType)
     {
-        super(writeEndpoints, pendingEndpoints, consistencyLevel, callback);
-        blockFor = consistencyLevel.blockFor(table);
-        responses = new AtomicInteger(blockFor);
+        super(table, writeEndpoints, pendingEndpoints, consistencyLevel, callback, writeType);
+        responses = new AtomicInteger(consistencyLevel.blockFor(table));
     }
 
-    protected WriteResponseHandler(InetAddress endpoint)
+    public WriteResponseHandler(InetAddress endpoint, WriteType writeType, Runnable callback)
     {
-        super(Arrays.asList(endpoint), Collections.<InetAddress>emptyList(), ConsistencyLevel.ALL, null);
-        blockFor = 1;
-        responses = new AtomicInteger(1);
+        this(Arrays.asList(endpoint), Collections.<InetAddress>emptyList(), ConsistencyLevel.ONE, null, callback, writeType);
     }
 
-    public static AbstractWriteResponseHandler create(Collection<InetAddress> writeEndpoints, Collection<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table, Runnable callback)
+    public WriteResponseHandler(InetAddress endpoint, WriteType writeType)
     {
-        return new WriteResponseHandler(writeEndpoints, pendingEndpoints, consistencyLevel, table, callback);
-    }
-
-    public static AbstractWriteResponseHandler create(InetAddress endpoint)
-    {
-        return new WriteResponseHandler(endpoint);
+        this(endpoint, writeType, null);
     }
 
     public void response(MessageIn m)
@@ -74,33 +72,7 @@ public class WriteResponseHandler extends AbstractWriteResponseHandler
 
     protected int ackCount()
     {
-        return blockFor - responses.get();
-    }
-
-    protected int blockForCL()
-    {
-        return blockFor;
-    }
-
-    public void assureSufficientLiveNodes() throws UnavailableException
-    {
-        if (consistencyLevel == ConsistencyLevel.ANY)
-        {
-            // local hint is acceptable, and local node is always live
-            return;
-        }
-
-        // count destinations that are part of the desired target set
-        int liveNodes = 0;
-        for (InetAddress destination : Iterables.concat(naturalEndpoints, pendingEndpoints))
-        {
-            if (FailureDetector.instance.isAlive(destination))
-                liveNodes++;
-        }
-        if (liveNodes < blockFor)
-        {
-            throw new UnavailableException(consistencyLevel, blockFor, liveNodes);
-        }
+        return consistencyLevel.blockFor(table) - responses.get();
     }
 
     public boolean isLatencyForSnitch()

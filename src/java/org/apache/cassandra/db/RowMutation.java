@@ -18,7 +18,6 @@
 package org.apache.cassandra.db;
 
 import java.io.DataInput;
-import java.io.DataInputStream;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -29,11 +28,8 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.KSMetaData;
 import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.filter.QueryPath;
 import org.apache.cassandra.db.marshal.UUIDType;
-import org.apache.cassandra.io.IColumnSerializer;
 import org.apache.cassandra.io.IVersionedSerializer;
-import org.apache.cassandra.io.util.FastByteArrayInputStream;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.thrift.ColumnOrSuperColumn;
@@ -52,8 +48,6 @@ public class RowMutation implements IMutation
     private final ByteBuffer key;
     // map of column family id to mutations for that column family.
     protected Map<UUID, ColumnFamily> modifications = new HashMap<UUID, ColumnFamily>();
-
-    private final Map<Integer, byte[]> preserializedBuffers = new HashMap<Integer, byte[]>();
 
     public RowMutation(String table, ByteBuffer key)
     {
@@ -105,7 +99,7 @@ public class RowMutation implements IMutation
     public static RowMutation hintFor(RowMutation mutation, UUID targetId) throws IOException
     {
         RowMutation rm = new RowMutation(Table.SYSTEM_KS, UUIDType.instance.decompose(targetId));
-        UUID hintId = UUIDGen.makeType1UUIDFromHost(FBUtilities.getBroadcastAddress());
+        UUID hintId = UUIDGen.getTimeUUID();
 
         // determine the TTL for the RowMutation
         // this is set at the smallest GCGraceSeconds for any of the CFs in the RM
@@ -115,8 +109,9 @@ public class RowMutation implements IMutation
             ttl = Math.min(ttl, cf.metadata().getGcGraceSeconds());
 
         // serialize the hint with id and version as a composite column name
-        QueryPath path = new QueryPath(SystemTable.HINTS_CF, null, HintedHandOffManager.comparator.decompose(hintId, MessagingService.current_version));
-        rm.add(path, ByteBuffer.wrap(mutation.getSerializedBuffer(MessagingService.current_version)), System.currentTimeMillis(), ttl);
+        ByteBuffer name = HintedHandOffManager.comparator.decompose(hintId, MessagingService.current_version);
+        ByteBuffer value = ByteBuffer.wrap(FBUtilities.serialize(mutation, serializer, MessagingService.current_version));
+        rm.add(SystemTable.HINTS_CF, name, value, System.currentTimeMillis(), ttl);
 
         return rm;
     }
@@ -156,81 +151,37 @@ public class RowMutation implements IMutation
         return modifications.isEmpty();
     }
 
-    /*
-     * Specify a column name and a corresponding value for
-     * the column. Column name is specified as <column family>:column.
-     * This will result in a ColumnFamily associated with
-     * <column family> as name and a Column with <column>
-     * as name. The column can be further broken up
-     * as super column name : columnname  in case of super columns
-     *
-     * param @ cf - column name as <column family>:<column>
-     * param @ value - value associated with the column
-     * param @ timestamp - timestamp associated with this data.
-     * param @ timeToLive - ttl for the column, 0 for standard (non expiring) columns
-     *
-     * @Deprecated this tends to be low-performance; we're doing two hash lookups,
-     * one of which instantiates a Pair, and callers tend to instantiate new QP objects
-     * for each call as well.  Use the add(ColumnFamily) overload instead.
-     */
-    public void add(QueryPath path, ByteBuffer value, long timestamp, int timeToLive)
+    public void add(String cfName, ByteBuffer name, ByteBuffer value, long timestamp, int timeToLive)
     {
-        UUID id = Schema.instance.getId(table, path.columnFamilyName);
-        ColumnFamily columnFamily = modifications.get(id);
-
-        if (columnFamily == null)
-        {
-            columnFamily = ColumnFamily.create(table, path.columnFamilyName);
-            modifications.put(id, columnFamily);
-        }
-        columnFamily.addColumn(path, value, timestamp, timeToLive);
+        addOrGet(cfName).addColumn(name, value, timestamp, timeToLive);
     }
 
-    public void addCounter(QueryPath path, long value)
+    public void addCounter(String cfName, ByteBuffer name, long value)
     {
-        UUID id = Schema.instance.getId(table, path.columnFamilyName);
-        ColumnFamily columnFamily = modifications.get(id);
-
-        if (columnFamily == null)
-        {
-            columnFamily = ColumnFamily.create(table, path.columnFamilyName);
-            modifications.put(id, columnFamily);
-        }
-        columnFamily.addCounter(path, value);
+        addOrGet(cfName).addCounter(name, value);
     }
 
-    public void add(QueryPath path, ByteBuffer value, long timestamp)
+    public void add(String cfName, ByteBuffer name, ByteBuffer value, long timestamp)
     {
-        add(path, value, timestamp, 0);
+        add(cfName, name, value, timestamp, 0);
     }
 
-    public void delete(QueryPath path, long timestamp)
+    public void delete(String cfName, long timestamp)
     {
-        UUID id = Schema.instance.getId(table, path.columnFamilyName);
-
         int localDeleteTime = (int) (System.currentTimeMillis() / 1000);
+        addOrGet(cfName).delete(new DeletionInfo(timestamp, localDeleteTime));
+    }
 
-        ColumnFamily columnFamily = modifications.get(id);
-        if (columnFamily == null)
-        {
-            columnFamily = ColumnFamily.create(table, path.columnFamilyName);
-            modifications.put(id, columnFamily);
-        }
+    public void delete(String cfName, ByteBuffer name, long timestamp)
+    {
+        int localDeleteTime = (int) (System.currentTimeMillis() / 1000);
+        addOrGet(cfName).addTombstone(name, localDeleteTime, timestamp);
+    }
 
-        if (path.superColumnName == null && path.columnName == null)
-        {
-            columnFamily.delete(new DeletionInfo(timestamp, localDeleteTime));
-        }
-        else if (path.columnName == null)
-        {
-            SuperColumn sc = new SuperColumn(path.superColumnName, columnFamily.getSubComparator());
-            sc.delete(new DeletionInfo(timestamp, localDeleteTime));
-            columnFamily.addColumn(sc);
-        }
-        else
-        {
-            columnFamily.addTombstone(path, localDeleteTime, timestamp);
-        }
+    public void deleteRange(String cfName, ByteBuffer start, ByteBuffer end, long timestamp)
+    {
+        int localDeleteTime = (int) (System.currentTimeMillis() / 1000);
+        addOrGet(cfName).addAtom(new RangeTombstone(start, end, timestamp, localDeleteTime));
     }
 
     public void addAll(IMutation m)
@@ -258,8 +209,8 @@ public class RowMutation implements IMutation
      */
     public void apply()
     {
-        KSMetaData ksm = Schema.instance.getTableDefinition(getTable());
-        Table.open(table).apply(this, ksm.durableWrites);
+        Table ks = Table.open(table);
+        ks.apply(this, ks.metadata.durableWrites);
     }
 
     public void applyUnsafe()
@@ -275,17 +226,6 @@ public class RowMutation implements IMutation
     public MessageOut<RowMutation> createMessage(MessagingService.Verb verb)
     {
         return new MessageOut<RowMutation>(verb, this, serializer);
-    }
-
-    public synchronized byte[] getSerializedBuffer(int version) throws IOException
-    {
-        byte[] bytes = preserializedBuffers.get(version);
-        if (bytes == null)
-        {
-            bytes = FBUtilities.serialize(this, serializer, version);
-            preserializedBuffers.put(version, bytes);
-        }
-        return bytes;
     }
 
     public String toString()
@@ -314,68 +254,6 @@ public class RowMutation implements IMutation
         return buff.append("])").toString();
     }
 
-    public void addColumnOrSuperColumn(String cfName, ColumnOrSuperColumn cosc)
-    {
-        if (cosc.super_column != null)
-        {
-            for (org.apache.cassandra.thrift.Column column : cosc.super_column.columns)
-            {
-                add(new QueryPath(cfName, cosc.super_column.name, column.name), column.value, column.timestamp, column.ttl);
-            }
-        }
-        else if (cosc.column != null)
-        {
-            add(new QueryPath(cfName, null, cosc.column.name), cosc.column.value, cosc.column.timestamp, cosc.column.ttl);
-        }
-        else if (cosc.counter_super_column != null)
-        {
-            for (org.apache.cassandra.thrift.CounterColumn column : cosc.counter_super_column.columns)
-            {
-                addCounter(new QueryPath(cfName, cosc.counter_super_column.name, column.name), column.value);
-            }
-        }
-        else // cosc.counter_column != null
-        {
-            addCounter(new QueryPath(cfName, null, cosc.counter_column.name), cosc.counter_column.value);
-        }
-    }
-
-    public void deleteColumnOrSuperColumn(String cfName, Deletion del)
-    {
-        if (del.predicate != null && del.predicate.column_names != null)
-        {
-            for(ByteBuffer c : del.predicate.column_names)
-            {
-                if (del.super_column == null && Schema.instance.getColumnFamilyType(table, cfName) == ColumnFamilyType.Super)
-                    delete(new QueryPath(cfName, c), del.timestamp);
-                else
-                    delete(new QueryPath(cfName, del.super_column, c), del.timestamp);
-            }
-        }
-        else
-        {
-            delete(new QueryPath(cfName, del.super_column), del.timestamp);
-        }
-    }
-
-    public static RowMutation fromBytes(byte[] raw, int version) throws IOException
-    {
-        RowMutation rm = serializer.deserialize(new DataInputStream(new FastByteArrayInputStream(raw)), version);
-        boolean hasCounters = false;
-        for (Map.Entry<UUID, ColumnFamily> entry : rm.modifications.entrySet())
-        {
-            if (entry.getValue().metadata().getDefaultValidator().isCommutative())
-            {
-                hasCounters = true;
-                break;
-            }
-        }
-
-        // We need to deserialize at least once for counters to cleanup the delta
-        if (!hasCounters && version == MessagingService.current_version)
-            rm.preserializedBuffers.put(version, raw);
-        return rm;
-    }
 
     public static class RowMutationSerializer implements IVersionedSerializer<RowMutation>
     {
@@ -396,7 +274,7 @@ public class RowMutation implements IMutation
             }
         }
 
-        public RowMutation deserialize(DataInput dis, int version, IColumnSerializer.Flag flag) throws IOException
+        public RowMutation deserialize(DataInput dis, int version, ColumnSerializer.Flag flag) throws IOException
         {
             String table = dis.readUTF();
             ByteBuffer key = ByteBufferUtil.readWithShortLength(dis);
@@ -417,7 +295,7 @@ public class RowMutation implements IMutation
 
         public RowMutation deserialize(DataInput dis, int version) throws IOException
         {
-            return deserialize(dis, version, IColumnSerializer.Flag.FROM_REMOTE);
+            return deserialize(dis, version, ColumnSerializer.Flag.FROM_REMOTE);
         }
 
         public long serializedSize(RowMutation rm, int version)

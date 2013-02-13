@@ -17,25 +17,33 @@
  */
 package org.apache.cassandra.config;
 
-import org.apache.cassandra.cache.ConcurrentLinkedHashCacheProvider;
+import org.apache.cassandra.cache.SerializingCacheProvider;
+import org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOptions;
+import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
+import org.apache.cassandra.io.util.NativeAllocator;
+import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * A class that contains configuration properties for the cassandra node it runs within.
  * 
  * Properties declared as volatile can be mutated via JMX.
  */
+
+
 public class Config
 {
     public String cluster_name = "Test Cluster";
     public String authenticator;
-    public String authority;
+    public String authority; // for backwards compatibility - will log a warning.
+    public String authorizer;
+    public int permissions_validity_in_ms = 2000;
 
     /* Hashing strategy Random or OPHF */
     public String partitioner;
 
     public Boolean auto_bootstrap = true;
     public volatile Boolean hinted_handoff_enabled = true;
-    public volatile Integer max_hint_window_in_ms = Integer.MAX_VALUE;
+    public volatile Integer max_hint_window_in_ms = 3600 * 1000; // one hour
 
     public SeedProviderDef seed_provider;
     public DiskAccessMode disk_access_mode = DiskAccessMode.auto;
@@ -46,17 +54,19 @@ public class Config
     public String initial_token;
     public Integer num_tokens = 1;
 
-    public volatile Long rpc_timeout_in_ms = new Long(10000);
+    public volatile Long request_timeout_in_ms = new Long(10000);
 
-    public Long read_rpc_timeout_in_ms = new Long(10000);
+    public Long read_request_timeout_in_ms = new Long(10000);
 
-    public Long range_rpc_timeout_in_ms = new Long(10000);
+    public Long range_request_timeout_in_ms = new Long(10000);
 
-    public Long write_rpc_timeout_in_ms = new Long(10000);
+    public Long write_request_timeout_in_ms = new Long(10000);
 
-    public Long truncate_rpc_timeout_in_ms = new Long(300000);
+    public Long truncate_request_timeout_in_ms = new Long(60000);
 
     public Integer streaming_socket_timeout_in_ms = new Integer(0);
+
+    public boolean cross_node_timeout = false;
 
     public volatile Double phi_convict_threshold = 8.0;
 
@@ -81,11 +91,13 @@ public class Config
     public Integer rpc_max_threads = null;
     public Integer rpc_send_buff_size_in_bytes;
     public Integer rpc_recv_buff_size_in_bytes;
+    public Integer internode_send_buff_size_in_bytes;
+    public Integer internode_recv_buff_size_in_bytes;
 
     public Boolean start_native_transport = false;
-    public String native_transport_address;
-    public Integer native_transport_port = 8000;
-    public Integer native_transport_max_threads = Integer.MAX_VALUE;
+    public Integer native_transport_port = 9042;
+    public Integer native_transport_min_threads = 16;
+    public Integer native_transport_max_threads = 128;
 
     public Integer thrift_max_message_length_in_mb = 16;
     public Integer thrift_framed_transport_size_in_mb = 15;
@@ -94,8 +106,8 @@ public class Config
 
     /* if the size of columns or super-columns are more than this, indexing will kick in */
     public Integer column_index_size_in_kb = 64;
-    public Integer in_memory_compaction_limit_in_mb = 256;
-    public Integer concurrent_compactors = Runtime.getRuntime().availableProcessors();
+    public Integer in_memory_compaction_limit_in_mb = 64;
+    public Integer concurrent_compactors = FBUtilities.getAvailableProcessors();
     public volatile Integer compaction_throughput_mb_per_sec = 16;
     public Boolean multithreaded_compaction = false;
 
@@ -125,11 +137,12 @@ public class Config
     public RequestSchedulerId request_scheduler_id;
     public RequestSchedulerOptions request_scheduler_options;
 
-    public EncryptionOptions encryption_options = new EncryptionOptions();
+    public ServerEncryptionOptions server_encryption_options = new ServerEncryptionOptions();
+    public ClientEncryptionOptions client_encryption_options = new ClientEncryptionOptions();
+    // this encOptions is for backward compatibility (a warning is logged by DatabaseDescriptor)
+    public ServerEncryptionOptions encryption_options;
 
     public InternodeCompression internode_compression = InternodeCompression.none;
-
-    public Integer index_interval = 128;
 
     public Double flush_largest_memtables_at = 1.0;
     public Double reduce_cache_sizes_at = 1.0;
@@ -150,8 +163,11 @@ public class Config
     public long row_cache_size_in_mb = 0;
     public volatile int row_cache_save_period = 0;
     public int row_cache_keys_to_save = Integer.MAX_VALUE;
-    public String row_cache_provider = ConcurrentLinkedHashCacheProvider.class.getSimpleName();
+    public String row_cache_provider = SerializingCacheProvider.class.getSimpleName();
+    public String memory_allocator = NativeAllocator.class.getSimpleName();
     public boolean populate_io_cache_on_flush = false;
+
+    public boolean inter_dc_tcp_nodelay = false;
 
     private static boolean loadYaml = true;
     private static boolean outboundBindAny = false;

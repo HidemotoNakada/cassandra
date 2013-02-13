@@ -26,6 +26,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import com.google.common.base.Function;
 import com.google.common.base.Throwables;
 
+import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+import org.apache.cassandra.concurrent.StageManager;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.index.SecondaryIndexManager;
 import org.apache.cassandra.io.util.DiskAwareRunnable;
 import org.cliffc.high_scale_lib.NonBlockingHashSet;
@@ -41,6 +44,7 @@ import org.apache.cassandra.db.commitlog.ReplayPosition;
 import org.apache.cassandra.db.filter.AbstractColumnIterator;
 import org.apache.cassandra.db.filter.NamesQueryFilter;
 import org.apache.cassandra.db.filter.SliceQueryFilter;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.sstable.SSTableMetadata;
 import org.apache.cassandra.io.sstable.SSTableReader;
 import org.apache.cassandra.io.sstable.SSTableWriter;
@@ -49,6 +53,26 @@ import org.apache.cassandra.utils.SlabAllocator;
 public class Memtable
 {
     private static final Logger logger = LoggerFactory.getLogger(Memtable.class);
+
+    /*
+     * switchMemtable puts Memtable.getSortedContents on the writer executor.  When the write is complete,
+     * we turn the writer into an SSTableReader and add it to ssTables where it is available for reads.
+     *
+     * There are two other things that switchMemtable does.
+     * First, it puts the Memtable into memtablesPendingFlush, where it stays until the flush is complete
+     * and it's been added as an SSTableReader to ssTables_.  Second, it adds an entry to commitLogUpdater
+     * that waits for the flush to complete, then calls onMemtableFlush.  This allows multiple flushes
+     * to happen simultaneously on multicore systems, while still calling onMF in the correct order,
+     * which is necessary for replay in case of a restart since CommitLog assumes that when onMF is
+     * called, all data up to the given context has been persisted to SSTables.
+     */
+    private static final ExecutorService flushWriter
+            = new JMXEnabledThreadPoolExecutor(DatabaseDescriptor.getFlushWriters(),
+                                               StageManager.KEEPALIVE,
+                                               TimeUnit.SECONDS,
+                                               new LinkedBlockingQueue<Runnable>(DatabaseDescriptor.getFlushQueueSize()),
+                                               new NamedThreadFactory("FlushWriter"),
+                                               "internal");
 
     // size in memory can never be less than serialized size
     private static final double MIN_SANE_LIVE_RATIO = 1.0;
@@ -80,7 +104,6 @@ public class Memtable
 
     volatile static Memtable activelyMeasuring;
 
-    private volatile boolean isFrozen;
     private final AtomicLong currentSize = new AtomicLong(0);
     private final AtomicLong currentOperations = new AtomicLong(0);
 
@@ -93,18 +116,25 @@ public class Memtable
 
     private final SlabAllocator allocator = new SlabAllocator();
     // We really only need one column by allocator but one by memtable is not a big waste and avoids needing allocators to know about CFS
-    private final Function<IColumn, IColumn> localCopyFunction = new Function<IColumn, IColumn>()
+    private final Function<Column, Column> localCopyFunction = new Function<Column, Column>()
     {
-        public IColumn apply(IColumn c)
+        public Column apply(Column c)
         {
             return c.localCopy(cfs, allocator);
         };
     };
 
+    // Record the comparator of the CFS at the creation of the memtable. This
+    // is only used when a user update the CF comparator, to know if the
+    // memtable was created with the new or old comparator.
+    public final AbstractType initialComparator;
+
     public Memtable(ColumnFamilyStore cfs)
     {
         this.cfs = cfs;
         this.creationTime = System.currentTimeMillis();
+        this.initialComparator = cfs.metadata.comparator;
+        this.cfs.scheduleFlush();
 
         Callable<Set<Object>> provider = new Callable<Set<Object>>()
         {
@@ -134,16 +164,6 @@ public class Memtable
         return currentOperations.get();
     }
 
-    boolean isFrozen()
-    {
-        return isFrozen;
-    }
-
-    void freeze()
-    {
-        isFrozen = true;
-    }
-
     /**
      * Should only be called by ColumnFamilyStore.apply.  NOT a public API.
      * (CFS handles locking to avoid submitting an op
@@ -151,7 +171,6 @@ public class Memtable
     */
     void put(DecoratedKey key, ColumnFamily columnFamily, SecondaryIndexManager.Updater indexer)
     {
-        assert !isFrozen; // not 100% foolproof but hell, it's an assert
         resolve(key, columnFamily, indexer);
     }
 
@@ -230,7 +249,7 @@ public class Memtable
         if (previous == null)
         {
             // AtomicSortedColumns doesn't work for super columns (see #3821)
-            ColumnFamily empty = cf.cloneMeShallow(cf.isSuper() ? ThreadSafeSortedColumns.factory() : AtomicSortedColumns.factory(), false);
+            ColumnFamily empty = cf.cloneMeShallow(AtomicSortedColumns.factory(), false);
             // We'll add the columns later. This avoids wasting works if we get beaten in the putIfAbsent
             previous = columnFamilies.putIfAbsent(new DecoratedKey(key.token, allocator.clone(key.key)), empty);
             if (previous == null)
@@ -257,15 +276,15 @@ public class Memtable
         return builder.toString();
     }
 
-    public void flushAndSignal(final CountDownLatch latch, ExecutorService writer, final Future<ReplayPosition> context)
+    public void flushAndSignal(final CountDownLatch latch, final Future<ReplayPosition> context)
     {
-        writer.execute(new FlushRunnable(latch, context));
+        flushWriter.execute(new FlushRunnable(latch, context));
     }
 
     public String toString()
     {
         return String.format("Memtable-%s@%s(%s/%s serialized/live bytes, %s ops)",
-                             cfs.getColumnFamilyName(), hashCode(), currentSize, getLiveSize(), currentOperations);
+                             cfs.name, hashCode(), currentSize, getLiveSize(), currentOperations);
     }
 
     /**
@@ -306,12 +325,21 @@ public class Memtable
     }
 
     /**
+     * @return true if this memtable is expired. Expiration time is determined by CF's memtable_flush_period_in_ms.
+     */
+    public boolean isExpired()
+    {
+        int period = cfs.metadata.getMemtableFlushPeriod();
+        return period > 0 && (System.currentTimeMillis() >= creationTime + period);
+    }
+
+    /**
      * obtain an iterator of columns in this memtable in the specified order starting from a given column.
      */
     public static OnDiskAtomIterator getSliceIterator(final DecoratedKey key, final ColumnFamily cf, SliceQueryFilter filter)
     {
         assert cf != null;
-        final Iterator<IColumn> filteredIter = filter.reversed ? cf.reverseIterator(filter.slices) : cf.iterator(filter.slices);
+        final Iterator<Column> filteredIter = filter.reversed ? cf.reverseIterator(filter.slices) : cf.iterator(filter.slices);
 
         return new AbstractColumnIterator()
         {
@@ -340,7 +368,6 @@ public class Memtable
     public static OnDiskAtomIterator getNamesIterator(final DecoratedKey key, final ColumnFamily cf, final NamesQueryFilter filter)
     {
         assert cf != null;
-        final boolean isStandard = !cf.isSuper();
 
         return new SimpleAbstractColumnIterator()
         {
@@ -361,10 +388,9 @@ public class Memtable
                 while (iter.hasNext())
                 {
                     ByteBuffer current = iter.next();
-                    IColumn column = cf.getColumn(current);
+                    Column column = cf.getColumn(current);
                     if (column != null)
-                        // clone supercolumns so caller can freely removeDeleted or otherwise mutate it
-                        return isStandard ? column : ((SuperColumn)column).cloneMe();
+                        return column;
                 }
                 return endOfData();
             }
@@ -415,22 +441,28 @@ public class Memtable
             return estimatedSize;
         }
 
-        protected void runWith(File dataDirectory) throws Exception
+        protected void runWith(File sstableDirectory) throws Exception
         {
-            assert dataDirectory != null : "Flush task is not bound to any disk";
+            assert sstableDirectory != null : "Flush task is not bound to any disk";
 
-            SSTableReader sstable = writeSortedContents(context, dataDirectory);
+            SSTableReader sstable = writeSortedContents(context, sstableDirectory);
             cfs.replaceFlushed(Memtable.this, sstable);
             latch.countDown();
         }
 
-        private SSTableReader writeSortedContents(Future<ReplayPosition> context, File dataDirectory) throws ExecutionException, InterruptedException
+        protected Directories getDirectories()
+        {
+            return cfs.directories;
+        }
+
+        private SSTableReader writeSortedContents(Future<ReplayPosition> context, File sstableDirectory)
+        throws ExecutionException, InterruptedException
         {
             logger.info("Writing " + Memtable.this.toString());
 
             SSTableReader ssTable;
             // errors when creating the writer that may leave empty temp files.
-            SSTableWriter writer = createFlushWriter(cfs.getTempSSTablePath(cfs.directories.getLocationForDisk(dataDirectory)));
+            SSTableWriter writer = createFlushWriter(cfs.getTempSSTablePath(sstableDirectory));
             try
             {
                 // (we can't clear out the map as-we-go to free up memory,
@@ -440,6 +472,14 @@ public class Memtable
                     ColumnFamily cf = entry.getValue();
                     if (cf.isMarkedForDelete())
                     {
+                        // When every node is up, there's no reason to write batchlog data out to sstables
+                        // (which in turn incurs cost like compaction) since the BL write + delete cancel each other out,
+                        // and BL data is strictly local, so we don't need to preserve tombstones for repair.
+                        // If we have a data row + row level tombstone, then writing it is effectively an expensive no-op so we skip it.
+                        // See CASSANDRA-4667.
+                        if (cfs.name.equals(SystemTable.BATCHLOG_CF) && cfs.table.getName().equals(Table.SYSTEM_KS) && !cf.isEmpty())
+                            continue;
+
                         // Pedantically, you could purge column level tombstones that are past GcGRace when writing to the SSTable.
                         // But it can result in unexpected behaviour where deletes never make it to disk,
                         // as they are lost and so cannot override existing column values. So we only remove deleted columns if there
@@ -449,9 +489,19 @@ public class Memtable
                     writer.append((DecoratedKey)entry.getKey(), cf);
                 }
 
-                ssTable = writer.closeAndOpenReader();
-                logger.info(String.format("Completed flushing %s (%d bytes) for commitlog position %s",
-                            ssTable.getFilename(), new File(ssTable.getFilename()).length(), context.get()));
+                if (writer.getFilePointer() > 0)
+                {
+                    ssTable = writer.closeAndOpenReader();
+                    logger.info(String.format("Completed flushing %s (%d bytes) for commitlog position %s",
+                                              ssTable.getFilename(), new File(ssTable.getFilename()).length(), context.get()));
+                }
+                else
+                {
+                    writer.abort();
+                    ssTable = null;
+                    logger.info("Completed flushing; nothing needed to be retained.  Commitlog position was {}",
+                                context.get());
+                }
                 return ssTable;
             }
             catch (Throwable e)

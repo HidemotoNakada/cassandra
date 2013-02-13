@@ -24,6 +24,7 @@ import java.util.Map.Entry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.Table;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.locator.TokenMetadata.Topology;
@@ -174,7 +175,8 @@ public class NetworkTopologyStrategy extends AbstractReplicationStrategy
 
     public int getReplicationFactor(String dc)
     {
-        return datacenters.get(dc);
+        Integer replicas = datacenters.get(dc);
+        return replicas == null ? 0 : replicas;
     }
 
     public Set<String> getDatacenters()
@@ -188,6 +190,5 @@ public class NetworkTopologyStrategy extends AbstractReplicationStrategy
         {
             validateReplicationFactor(e.getValue());
         }
-
     }
 }

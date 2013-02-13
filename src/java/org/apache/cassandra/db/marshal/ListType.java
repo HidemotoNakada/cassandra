@@ -17,14 +17,13 @@
  */
 package org.apache.cassandra.db.marshal;
 
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.db.IColumn;
+import org.apache.cassandra.db.Column;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 
 public class ListType<T> extends CollectionType<List<T>>
@@ -45,10 +44,10 @@ public class ListType<T> extends CollectionType<List<T>>
 
     public static synchronized <T> ListType<T> getInstance(AbstractType<T> elements)
     {
-        ListType t = instances.get(elements);
+        ListType<T> t = instances.get(elements);
         if (t == null)
         {
-            t = new ListType(elements);
+            t = new ListType<T>(elements);
             instances.put(elements, t);
         }
         return t;
@@ -72,17 +71,26 @@ public class ListType<T> extends CollectionType<List<T>>
 
     public List<T> compose(ByteBuffer bytes)
     {
-        ByteBuffer input = bytes.duplicate();
-        int n = input.getShort();
-        List<T> l = new ArrayList<T>(n);
-        for (int i = 0; i < n; i++)
+        try
         {
-            int s = input.getShort();
-            byte[] data = new byte[s];
-            input.get(data);
-            l.add(elements.compose(ByteBuffer.wrap(data)));
+            ByteBuffer input = bytes.duplicate();
+            int n = input.getShort();
+            List<T> l = new ArrayList<T>(n);
+            for (int i = 0; i < n; i++)
+            {
+                int s = input.getShort();
+                byte[] data = new byte[s];
+                input.get(data);
+                ByteBuffer databb = ByteBuffer.wrap(data);
+                elements.validate(databb);
+                l.add(elements.compose(databb));
+            }
+            return l;
         }
-        return l;
+        catch (BufferUnderflowException e)
+        {
+            throw new MarshalException("Not enough bytes to read a list");
+        }
     }
 
     /**
@@ -110,11 +118,11 @@ public class ListType<T> extends CollectionType<List<T>>
         sb.append(getClass().getName()).append(TypeParser.stringifyTypeParameters(Collections.<AbstractType<?>>singletonList(elements)));
     }
 
-    public ByteBuffer serialize(List<Pair<ByteBuffer, IColumn>> columns)
+    public ByteBuffer serialize(List<Pair<ByteBuffer, Column>> columns)
     {
         List<ByteBuffer> bbs = new ArrayList<ByteBuffer>(columns.size());
         int size = 0;
-        for (Pair<ByteBuffer, IColumn> p : columns)
+        for (Pair<ByteBuffer, Column> p : columns)
         {
             bbs.add(p.right.value());
             size += 2 + p.right.value().remaining();

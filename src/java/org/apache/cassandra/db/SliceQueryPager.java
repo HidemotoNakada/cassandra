@@ -30,7 +30,6 @@ public class SliceQueryPager implements Iterator<ColumnFamily>
     public final DecoratedKey key;
 
     private ColumnSlice[] slices;
-    private ColumnFamily current;
     private boolean exhausted;
 
     public SliceQueryPager(ColumnFamilyStore cfs, DecoratedKey key, ColumnSlice[] slices)
@@ -52,17 +51,17 @@ public class SliceQueryPager implements Iterator<ColumnFamily>
         if (exhausted)
             return null;
 
-        QueryPath path = new QueryPath(cfs.getColumnFamilyName());
-        QueryFilter filter = new QueryFilter(key, path, new SliceQueryFilter(slices, false, DEFAULT_PAGE_SIZE));
+        SliceQueryFilter sliceFilter = new SliceQueryFilter(slices, false, DEFAULT_PAGE_SIZE);
+        QueryFilter filter = new QueryFilter(key, cfs.name, sliceFilter);
         ColumnFamily cf = cfs.getColumnFamily(filter);
-        if (cf == null || cf.getLiveColumnCount() < DEFAULT_PAGE_SIZE)
+        if (cf == null || sliceFilter.getLiveCount(cf) < DEFAULT_PAGE_SIZE)
         {
             exhausted = true;
         }
         else
         {
-            Iterator<IColumn> iter = cf.getReverseSortedColumns().iterator();
-            IColumn lastColumn = iter.next();
+            Iterator<Column> iter = cf.getReverseSortedColumns().iterator();
+            Column lastColumn = iter.next();
             while (lastColumn.isMarkedForDelete())
                 lastColumn = iter.next();
 

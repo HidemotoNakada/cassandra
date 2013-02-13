@@ -31,9 +31,11 @@ Table of Contents
         4.2.5.2. Rows
         4.2.5.3. Set_keyspace
         4.2.5.4. Prepared
+        4.2.5.5. Schema_change
       4.2.6. EVENT
   5. Compression
-  6. Error codes
+  6. Collection types
+  7. Error codes
 
 
 1. Overview
@@ -93,11 +95,24 @@ Table of Contents
 
 2.2. flags
 
-  Flags applying to this frame. Currently only one bit (the lower-most one, the
-  one masked by 0x01) has a meaning and indicates whether the frame body is
-  compressed. The actual compression to use should have been set up beforehand
-  through the Startup message (which thus cannot be compressed; Section 4.1.1).
-  The rest of the flags is kept for future use.
+  Flags applying to this frame. The flags have the following meaning (described
+  by the mask that allow to select them):
+    0x01: Compression flag. If set, the frame body is compressed. The actual
+          compression to use should have been set up beforehand through the
+          Startup message (which thus cannot be compressed; Section 4.1.1).
+    0x02: Tracing flag. For a request frame, this indicate the client requires
+          tracing of the request. Note that not all requests support tracing.
+          Currently, only QUERY, PREPARE and EXECUTE queries support tracing.
+          Other requests will simply ignore the tracing flag if set. If a
+          request support tracing and the tracing flag was set, the response to
+          this request will have the tracing flag set and contain tracing
+          information.
+          If a response frame has the tracing flag set, its body contains
+          a tracing ID. The tracing ID is a [uuid] and is the first thing in
+          the frame body. The rest of the body will then be the usual body
+          corresponding to the response opcode.
+
+  The rest of the flags is currently unused and ignored.
 
 2.3. stream
 
@@ -117,9 +132,11 @@ Table of Contents
   respond to. As there can only be 128 different simultaneous stream, it is up
   to the client to reuse stream id.
 
-  Note that clients are free to use the protocol synchronously (i.e.  wait for
+  Note that clients are free to use the protocol synchronously (i.e. wait for
   the response to REQ_N before sending REQ_N+1). In that case, the stream id
-  can be safely set to 0.
+  can be safely set to 0. Clients should also feel free to use only a subset of
+  the 128 maximum possible stream ids if it is simpler for those
+  implementation.
 
 2.4. opcode
 
@@ -157,9 +174,11 @@ Table of Contents
     [string]       A [short] n, followed by n bytes representing an UTF-8
                    string.
     [long string]  An [int] n, followed by n bytes representing an UTF-8 string.
+    [uuid]         A 16 bytes long uuid.
     [string list]  A [short] n, followed by n [string].
-    [bytes]        An [int] n, followed by n bytes if n >= 0. If n < 0,
+    [bytes]        A [int] n, followed by n bytes if n >= 0. If n < 0,
                    no byte should follow and the value represented is `null`.
+    [short bytes]  A [short] n, followed by n bytes if n >= 0.
 
     [option]       A pair of <id><value> where <id> is a [short] representing
                    the option id and <value> depends on that option (and can be
@@ -168,9 +187,20 @@ Table of Contents
     [option list]  A [short] n, followed by n [option].
     [inet]         An address (ip and port) to a node. It consists of one
                    [byte] n, that represents the address size, followed by n
-                   [byte] repesenting the IP address (in practice n can only be
+                   [byte] representing the IP address (in practice n can only be
                    either 4 (IPv4) or 16 (IPv6)), following by one [int]
                    representing the port.
+    [consistency]  A consistency level specification. This is a [short]
+                   representing a consistency level with the following
+                   correspondance:
+                     0x0000    ANY
+                     0x0001    ONE
+                     0x0002    TWO
+                     0x0003    THREE
+                     0x0004    QUORUM
+                     0x0005    ALL
+                     0x0006    LOCAL_QUORUM
+                     0x0007    EACH_QUORUM
 
     [string map]      A [short] n, followed by n pair <k><v> where <k> and <v>
                       are [string].
@@ -229,7 +259,10 @@ Table of Contents
 4.1.4. QUERY
 
   Performs a CQL query. The body of the message consists of a CQL query as a [long
-  string].
+  string] followed by the [consistency] for the operation.
+
+  Note that the consistency is ignored by some queries (USE, CREATE, ALTER,
+  TRUNCATE, ...).
 
   The server will respond to a QUERY message with a RESULT message, the content
   of which depends on the query.
@@ -247,13 +280,17 @@ Table of Contents
 4.1.6. EXECUTE
 
   Executes a prepared query. The body of the message must be:
-    <id><n><value_1>....<value_n>
+    <id><n><value_1>....<value_n><consistency>
   where:
-    - <id> is the prepared query ID. It's an [int] returned as a response to a
-      PREPARE message.
+    - <id> is the prepared query ID. It's the [short bytes] returned as a
+      response to a PREPARE message.
     - <n> is a [short] indicating the number of following values.
     - <value_1>...<value_n> are the [bytes] to use for bound variables in the
       prepared query.
+    - <consistency> is the [consistency] level for the operation.
+
+  Note that the consistency is ignored by some (prepared) queries (USE, CREATE,
+  ALTER, TRUNCATE, ...).
 
   The response from the server will be a RESULT message.
 
@@ -285,7 +322,7 @@ Table of Contents
   Indicates an error processing a request. The body of the message will be an
   error code ([int]) followed by a [string] error message. Then, depending on
   the exception, more content may follow. The error codes are defined in
-  Section 6, along with their additional content if any.
+  Section 7, along with their additional content if any.
 
 
 4.2.2. READY
@@ -326,7 +363,8 @@ Table of Contents
     0x0001    Void: for results carrying no information.
     0x0002    Rows: for results to select queries, returning a set of rows.
     0x0003    Set_keyspace: the result to a `use` query.
-    0x0004    Prepared: result to a PREPARE message
+    0x0004    Prepared: result to a PREPARE message.
+    0x0005    Schema_change: the result to a schema altering query.
 
   The body for each kind (after the [int] kind) is defined below.
 
@@ -411,8 +449,30 @@ Table of Contents
   The result to a PREPARE message. The rest of the body of a Prepared result is:
     <id><metadata>
   where:
-    - <id> is an [int] representing the prepared query ID.
+    - <id> is [short bytes] representing the prepared query ID.
     - <metadata> is defined exactly as for a Rows RESULT (See section 4.2.5.2).
+
+  Note that prepared query ID return is global to the node on which the query
+  has been prepared. It can be used on any connection to that node and this
+  until the node is restarted (after which the query must be reprepared).
+
+4.2.5.5. Schema_change
+
+  The result to a schema altering query (creation/update/drop of a
+  keyspace/table/index). The body (after the kind [int]) is composed of 3
+  [string]:
+    <change><keyspace><table>
+  where:
+    - <change> describe the type of change that has occured. It can be one of
+      "CREATED", "UPDATED" or "DROPPED".
+    - <keyspace> is the name of the affected keyspace or the keyspace of the
+      affected table.
+    - <table> is the name of the affected table. <table> will be empty (i.e.
+      the empty string "") if the change was affecting a keyspace and not a
+      table.
+
+  Note that queries to create and drop an index are considered as change
+  updating the table the index is on.
 
 
 4.2.6. EVENT
@@ -432,8 +492,21 @@ Table of Contents
       consists of a [string] and an [inet], corresponding respectively to the
       type of status change ("UP" or "DOWN") followed by the address of the
       concerned node.
+    - "SCHEMA_CHANGE": events related to schema change. The body of the message
+      (after the event type) consists of 3 [string] corresponding respectively
+      to the type of schema change ("CREATED", "UPDATED" or "DROPPED"),
+      followed by the name of the affected keyspace and the name of the
+      affected table within that keyspace. For changes that affect a keyspace
+      directly, the table name will be empty (i.e. the empty string "").
 
   All EVENT message have a streamId of -1 (Section 2.3).
+
+  Please note that "NEW_NODE" and "UP" events are sent based on internal Gossip
+  communication and as such may be sent a short delay before the binary
+  protocol server on the newly up node is fully started. Clients are thus
+  advise to wait a short time before trying to connect to the node (1 seconds
+  should be enough), otherwise they may experience a connection refusal at
+  first.
 
 
 5. Compression
@@ -451,7 +524,25 @@ Table of Contents
   flag (see Section 2.2) is set.
 
 
-6. Error codes
+6. Collection types
+
+  This section describe the serialization format for the collection types:
+  list, map and set. This serialization format is both useful to decode values
+  returned in RESULT messages but also to encode values for EXECUTE ones.
+
+  The serialization formats are:
+     List: a [short] n indicating the size of the list, followed by n elements.
+           Each element is [short bytes] representing the serialized element
+           value.
+     Map: a [short] n indicating the size of the map, followed by n entries.
+          Each entry is composed of two [short bytes] representing the key and
+          the value of the entry map.
+     Set: a [short] n indicating the size of the set, followed by n elements.
+          Each element is [short bytes] representing the serialized element
+          value.
+
+
+7. Error codes
 
   The supported error codes are described below:
     0x0000    Server error: something unexpected happened. This indicates a
@@ -459,12 +550,14 @@ Table of Contents
     0x000A    Protocol error: some client message triggered a protocol
               violation (for instance a QUERY message is sent before a STARTUP
               one has been sent)
+    0x0100    Bad credentials: CREDENTIALS request failed because Cassandra
+              did not accept the provided credentials.
 
     0x1000    Unavailable exception. The rest of the ERROR message body will be
                 <cl><required><alive>
               where:
-                <cl> is a [string] representing the consistency level of the
-                     query having triggered the exception.
+                <cl> is the [consistency] level of the query having triggered
+                     the exception.
                 <required> is an [int] representing the number of node that
                            should be alive to respect <cl>
                 <alive> is an [int] representing the number of replica that
@@ -478,20 +571,36 @@ Table of Contents
     0x1003    Truncate_error: error during a truncation error.
     0x1100    Write_timeout: Timeout exception during a write request. The rest
               of the ERROR message body will be
-                <cl><received><blockfor>
+                <cl><received><blockfor><writeType>
               where:
-                <cl> is a [string] representing the consistency level of the
-                     query having triggered the exception.
+                <cl> is the [consistency] level of the query having triggered
+                     the exception.
                 <received> is an [int] representing the number of nodes having
                            acknowledged the request.
                 <blockfor> is the number of replica whose acknowledgement is
                            required to achieve <cl>.
+                <writeType> is a [string] that describe the type of the write
+                            that timeouted. The value of that string can be one
+                            of:
+                             - "SIMPLE": the write was a non-batched
+                               non-counter write.
+                             - "BATCH": the write was a (logged) batch write.
+                               If this type is received, it means the batch log
+                               has been successfully written (otherwise a
+                               "BATCH_LOG" type would have been send instead).
+                             - "UNLOGGED_BATCH": the write was an unlogged
+                               batch. Not batch log write has been attempted.
+                             - "COUNTER": the write was a counter write
+                               (batched or not).
+                             - "BATCH_LOG": the timeout occured during the
+                               write to the batch log when a (logged) batch
+                               write was requested.
     0x1200    Read_timeout: Timeout exception during a read request. The rest
               of the ERROR message body will be
                 <cl><received><blockfor><data_present>
               where:
-                <cl> is a [string] representing the consistency level of the
-                     query having triggered the exception.
+                <cl> is the [consistency] level of the query having triggered
+                     the exception.
                 <received> is an [int] representing the number of nodes having
                            answered the request.
                 <blockfor> is the number of replica whose response is
@@ -522,5 +631,5 @@ Table of Contents
                         string.
     0x2500    Unprepared: Can be thrown while a prepared statement tries to be
               executed if the provide prepared statement ID is not known by
-              this host. The rest of the ERROR message body will be [bytes]
-              representing the unknown ID.
+              this host. The rest of the ERROR message body will be [short
+              bytes] representing the unknown ID.

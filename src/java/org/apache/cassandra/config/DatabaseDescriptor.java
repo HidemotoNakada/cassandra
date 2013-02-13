@@ -33,6 +33,8 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.auth.*;
 import org.apache.cassandra.cache.IRowCacheProvider;
 import org.apache.cassandra.config.Config.RequestSchedulerId;
+import org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOptions;
+import org.apache.cassandra.config.EncryptionOptions.ServerEncryptionOptions;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DefsTable;
 import org.apache.cassandra.db.SystemTable;
@@ -40,6 +42,7 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.IAllocator;
 import org.apache.cassandra.locator.DynamicEndpointSnitch;
 import org.apache.cassandra.locator.EndpointSnitchInfo;
 import org.apache.cassandra.locator.IEndpointSnitch;
@@ -49,7 +52,6 @@ import org.apache.cassandra.scheduler.IRequestScheduler;
 import org.apache.cassandra.scheduler.NoScheduler;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.service.MigrationManager;
-import org.apache.cassandra.thrift.ThriftServer;
 import org.apache.cassandra.utils.FBUtilities;
 import org.yaml.snakeyaml.Loader;
 import org.yaml.snakeyaml.TypeDescription;
@@ -64,7 +66,6 @@ public class DatabaseDescriptor
     private static InetAddress listenAddress; // leave null so we can fall through to getLocalHost
     private static InetAddress broadcastAddress;
     private static InetAddress rpcAddress;
-    private static InetAddress nativeTransportAddress;
     private static SeedProvider seedProvider;
 
     /* Hashing strategy Random or OPHF */
@@ -76,8 +77,7 @@ public class DatabaseDescriptor
     private static Config conf;
 
     private static IAuthenticator authenticator = new AllowAllAuthenticator();
-    private static IAuthority authority = new AllowAllAuthority();
-    private static IAuthorityContainer authorityContainer;
+    private static IAuthorizer authorizer = new AllowAllAuthorizer();
 
     private final static String DEFAULT_CONFIGURATION = "cassandra.yaml";
 
@@ -87,6 +87,10 @@ public class DatabaseDescriptor
 
     private static long keyCacheSizeInMB;
     private static IRowCacheProvider rowCacheProvider;
+    private static IAllocator memoryAllocator;
+
+    private static String localDC;
+    private static Comparator<InetAddress> localComparator;
 
     /**
      * Inspect the classpath to find storage configuration file
@@ -127,7 +131,7 @@ public class DatabaseDescriptor
         {
             URL url = getStorageConfigURL();
             logger.info("Loading settings from " + url);
-            InputStream input = null;
+            InputStream input;
             try
             {
                 input = url.openStream();
@@ -201,17 +205,23 @@ public class DatabaseDescriptor
 
             logger.info("disk_failure_policy is " + conf.disk_failure_policy);
 
-	        logger.debug("page_cache_hinting is " + conf.populate_io_cache_on_flush);
-
-            /* Authentication and authorization backend, implementing IAuthenticator and IAuthority */
+            /* Authentication and authorization backend, implementing IAuthenticator and IAuthorizer */
             if (conf.authenticator != null)
-                authenticator = FBUtilities.<IAuthenticator>construct(conf.authenticator, "authenticator");
-            if (conf.authority != null)
-                authority = FBUtilities.<IAuthority>construct(conf.authority, "authority");
-            authenticator.validateConfiguration();
-            authority.validateConfiguration();
+                authenticator = FBUtilities.construct(conf.authenticator, "authenticator");
 
-            authorityContainer = new IAuthorityContainer(authority);
+            if (conf.authority != null)
+            {
+                logger.warn("Please rename 'authority' to 'authorizer' in cassandra.yaml");
+                if (!conf.authority.equals("org.apache.cassandra.auth.AllowAllAuthority"))
+                    throw new ConfigurationException("IAuthority interface has been deprecated,"
+                                                     + " please implement IAuthorizer instead.");
+            }
+
+            if (conf.authorizer != null)
+                authorizer = FBUtilities.construct(conf.authorizer, "authorizer");
+
+            authenticator.validateConfiguration();
+            authorizer.validateConfiguration();
 
             /* Hashing strategy */
             if (conf.partitioner == null)
@@ -314,30 +324,11 @@ public class DatabaseDescriptor
                 rpcAddress = FBUtilities.getLocalAddress();
             }
 
-            /* Local IP or hostname to bind RPC server to */
-            if (conf.native_transport_address != null)
-            {
-                try
-                {
-                    nativeTransportAddress = InetAddress.getByName(conf.native_transport_address);
-                }
-                catch (UnknownHostException e)
-                {
-                    throw new ConfigurationException("Unknown host in native_transport_address" + conf.native_transport_address);
-                }
-            }
-            else
-            {
-                nativeTransportAddress = FBUtilities.getLocalAddress();
-            }
-
             if (conf.thrift_framed_transport_size_in_mb <= 0)
                 throw new ConfigurationException("thrift_framed_transport_size_in_mb must be positive");
 
-            if (conf.thrift_framed_transport_size_in_mb > 0 && conf.thrift_max_message_length_in_mb < conf.thrift_framed_transport_size_in_mb)
-            {
-                throw new ConfigurationException("thrift_max_message_length_in_mb must be greater than thrift_framed_transport_size_in_mb when using TFramedTransport");
-            }
+            if (conf.thrift_max_message_length_in_mb < conf.thrift_framed_transport_size_in_mb)
+                throw new ConfigurationException("thrift_max_message_length_in_mb must be greater than thrift_framed_transport_size_in_mb");
 
             /* end point snitch */
             if (conf.endpoint_snitch == null)
@@ -346,6 +337,21 @@ public class DatabaseDescriptor
             }
             snitch = createEndpointSnitch(conf.endpoint_snitch);
             EndpointSnitchInfo.create();
+
+            localDC = snitch.getDatacenter(FBUtilities.getBroadcastAddress());
+            localComparator = new Comparator<InetAddress>()
+            {
+                public int compare(InetAddress endpoint1, InetAddress endpoint2)
+                {
+                    boolean local1 = localDC.equals(snitch.getDatacenter(endpoint1));
+                    boolean local2 = localDC.equals(snitch.getDatacenter(endpoint2));
+                    if (local1 && !local2)
+                        return -1;
+                    if (local2 && !local1)
+                        return 1;
+                    return 0;
+                }
+            };
 
             /* Request Scheduler setup */
             requestSchedulerOptions = conf.request_scheduler_options;
@@ -395,7 +401,7 @@ public class DatabaseDescriptor
             }
 
             if (conf.concurrent_compactors == null)
-                conf.concurrent_compactors = Runtime.getRuntime().availableProcessors();
+                conf.concurrent_compactors = FBUtilities.getAvailableProcessors();
 
             if (conf.concurrent_compactors <= 0)
                 throw new ConfigurationException("concurrent_compactors should be strictly greater than 0");
@@ -406,8 +412,6 @@ public class DatabaseDescriptor
             if (conf.stream_throughput_outbound_megabits_per_sec == null)
                 conf.stream_throughput_outbound_megabits_per_sec = 400;
 
-            if (!ThriftServer.rpc_server_types.contains(conf.rpc_server_type.toLowerCase()))
-                throw new ConfigurationException("Unknown rpc_server_type: " + conf.rpc_server_type);
             if (conf.rpc_min_threads == null)
                 conf.rpc_min_threads = 16;
 
@@ -459,21 +463,27 @@ public class DatabaseDescriptor
             }
 
             rowCacheProvider = FBUtilities.newCacheProvider(conf.row_cache_provider);
+            memoryAllocator = FBUtilities.newOffHeapAllocator(conf.memory_allocator);
+
+            if(conf.encryption_options != null)
+            {
+                logger.warn("Please rename encryption_options as server_encryption_options in the yaml");
+                //operate under the assumption that server_encryption_options is not set in yaml rather than both
+                conf.server_encryption_options = conf.encryption_options;
+            }
 
             // Hardcoded system tables
-            List<KSMetaData> systemKeyspaces = Arrays.asList(KSMetaData.systemKeyspace(), KSMetaData.traceKeyspace());
+            List<KSMetaData> systemKeyspaces = Arrays.asList(KSMetaData.systemKeyspace(),
+                                                             KSMetaData.traceKeyspace(),
+                                                             KSMetaData.authKeyspace());
+            assert systemKeyspaces.size() == Schema.systemKeyspaceNames.size();
             for (KSMetaData ksmd : systemKeyspaces)
             {
+                // install the definition
                 for (CFMetaData cfm : ksmd.cfMetaData().values())
                     Schema.instance.load(cfm);
                 Schema.instance.setTableDefinition(ksmd);
             }
-
-            // setup schema required for authorization
-            authorityContainer.setup();
-
-            // setup schema required for authorization
-            authorityContainer.setup();
 
             /* Load the seeds for node contact points */
             if (conf.seed_provider == null)
@@ -592,14 +602,14 @@ public class DatabaseDescriptor
         return authenticator;
     }
 
-    public static IAuthority getAuthority()
+    public static IAuthorizer getAuthorizer()
     {
-        return authority;
+        return authorizer;
     }
 
-    public static IAuthorityContainer getAuthorityContainer()
+    public static int getPermissionsValidity()
     {
-        return authorityContainer;
+        return conf.permissions_validity_in_ms;
     }
 
     public static int getThriftMaxMessageLength()
@@ -747,52 +757,57 @@ public class DatabaseDescriptor
 
     public static long getRpcTimeout()
     {
-        return conf.rpc_timeout_in_ms;
+        return conf.request_timeout_in_ms;
     }
 
     public static void setRpcTimeout(Long timeOutInMillis)
     {
-        conf.rpc_timeout_in_ms = timeOutInMillis;
+        conf.request_timeout_in_ms = timeOutInMillis;
     }
 
     public static long getReadRpcTimeout()
     {
-        return conf.read_rpc_timeout_in_ms;
+        return conf.read_request_timeout_in_ms;
     }
 
     public static void setReadRpcTimeout(Long timeOutInMillis)
     {
-        conf.read_rpc_timeout_in_ms = timeOutInMillis;
+        conf.read_request_timeout_in_ms = timeOutInMillis;
     }
 
     public static long getRangeRpcTimeout()
     {
-        return conf.range_rpc_timeout_in_ms;
+        return conf.range_request_timeout_in_ms;
     }
 
     public static void setRangeRpcTimeout(Long timeOutInMillis)
     {
-        conf.range_rpc_timeout_in_ms = timeOutInMillis;
+        conf.range_request_timeout_in_ms = timeOutInMillis;
     }
 
     public static long getWriteRpcTimeout()
     {
-        return conf.write_rpc_timeout_in_ms;
+        return conf.write_request_timeout_in_ms;
     }
 
     public static void setWriteRpcTimeout(Long timeOutInMillis)
     {
-        conf.write_rpc_timeout_in_ms = timeOutInMillis;
+        conf.write_request_timeout_in_ms = timeOutInMillis;
     }
 
     public static long getTruncateRpcTimeout()
     {
-        return conf.truncate_rpc_timeout_in_ms;
+        return conf.truncate_request_timeout_in_ms;
     }
 
     public static void setTruncateRpcTimeout(Long timeOutInMillis)
     {
-        conf.truncate_rpc_timeout_in_ms = timeOutInMillis;
+        conf.truncate_request_timeout_in_ms = timeOutInMillis;
+    }
+
+    public static boolean hasCrossNodeTimeout()
+    {
+        return conf.cross_node_timeout;
     }
 
     // not part of the Verb enum so we can change timeouts easily via JMX
@@ -975,6 +990,16 @@ public class DatabaseDescriptor
         return conf.rpc_recv_buff_size_in_bytes;
     }
 
+    public static Integer getInternodeSendBufferSize()
+    {
+        return conf.internode_send_buff_size_in_bytes;
+    }
+
+    public static Integer getInternodeRecvBufferSize()
+    {
+        return conf.internode_recv_buff_size_in_bytes;
+    }
+
     public static boolean startNativeTransport()
     {
         return conf.start_native_transport;
@@ -982,12 +1007,17 @@ public class DatabaseDescriptor
 
     public static InetAddress getNativeTransportAddress()
     {
-        return nativeTransportAddress;
+        return getRpcAddress();
     }
 
     public static int getNativeTransportPort()
     {
         return Integer.parseInt(System.getProperty("cassandra.native_transport_port", conf.native_transport_port.toString()));
+    }
+
+    public static Integer getNativeTransportMinThreads()
+    {
+        return conf.native_transport_min_threads;
     }
 
     public static Integer getNativeTransportMaxThreads()
@@ -1017,6 +1047,11 @@ public class DatabaseDescriptor
     public static Config.DiskAccessMode getIndexAccessMode()
     {
         return indexAccessMode;
+    }
+
+    public static void setDiskFailurePolicy(Config.DiskFailurePolicy policy)
+    {
+        conf.disk_failure_policy = policy;
     }
 
     public static Config.DiskFailurePolicy getDiskFailurePolicy()
@@ -1058,11 +1093,6 @@ public class DatabaseDescriptor
         return conf.max_hint_window_in_ms;
     }
 
-    public static Integer getIndexInterval()
-    {
-        return conf.index_interval;
-    }
-
     public static File getSerializedCachePath(String ksName, String cfName, CacheService.CacheType cacheType, String version)
     {
         return new File(conf.saved_caches_directory + File.separator + ksName + "-" + cfName + "-" + cacheType + (version == null ? "" : "-" + version + ".db"));
@@ -1096,9 +1126,14 @@ public class DatabaseDescriptor
         conf.dynamic_snitch_badness_threshold = dynamicBadnessThreshold;
     }
 
-    public static EncryptionOptions getEncryptionOptions()
+    public static ServerEncryptionOptions getServerEncryptionOptions()
     {
-        return conf.encryption_options;
+        return conf.server_encryption_options;
+    }
+
+    public static ClientEncryptionOptions getClientEncryptionOptions()
+    {
+        return conf.client_encryption_options;
     }
 
     public static double getFlushLargestMemtablesAt()
@@ -1227,18 +1262,33 @@ public class DatabaseDescriptor
         return rowCacheProvider;
     }
 
+    public static IAllocator getoffHeapMemoryAllocator()
+    {
+        return memoryAllocator;
+    }
+
     public static int getStreamingSocketTimeout()
     {
         return conf.streaming_socket_timeout_in_ms;
     }
 
-    public static boolean populateIOCacheOnFlush()
+    public static String getLocalDataCenter()
     {
-        return conf.populate_io_cache_on_flush;
+        return localDC;
+    }
+
+    public static Comparator<InetAddress> getLocalComparator()
+    {
+        return localComparator;
     }
 
     public static Config.InternodeCompression internodeCompression()
     {
         return conf.internode_compression;
+    }
+
+    public static boolean getInterDCTcpNoDelay()
+    {
+        return conf.inter_dc_tcp_nodelay;
     }
 }

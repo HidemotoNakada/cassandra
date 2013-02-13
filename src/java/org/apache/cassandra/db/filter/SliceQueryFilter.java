@@ -19,13 +19,9 @@ package org.apache.cassandra.db.filter;
 
 import java.io.*;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.Iterator;
-import java.util.List;
+import java.util.*;
 
-import com.google.common.collect.Iterators;
+import com.google.common.collect.AbstractIterator;
 import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,8 +36,9 @@ import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.sstable.SSTableReader;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.tracing.Tracing;
 
-public class SliceQueryFilter implements IFilter
+public class SliceQueryFilter implements IDiskAtomFilter
 {
     private static final Logger logger = LoggerFactory.getLogger(SliceQueryFilter.class);
     public static final Serializer serializer = new Serializer();
@@ -49,7 +46,7 @@ public class SliceQueryFilter implements IFilter
     public final ColumnSlice[] slices;
     public final boolean reversed;
     public volatile int count;
-    private final int compositesToGroup;
+    public final int compositesToGroup;
     // This is a hack to allow rolling upgrade with pre-1.2 nodes
     private final int countMutliplierForCompatibility;
 
@@ -59,6 +56,11 @@ public class SliceQueryFilter implements IFilter
     public SliceQueryFilter(ByteBuffer start, ByteBuffer finish, boolean reversed, int count)
     {
         this(new ColumnSlice[] { new ColumnSlice(start, finish) }, reversed, count);
+    }
+
+    public SliceQueryFilter(ByteBuffer start, ByteBuffer finish, boolean reversed, int count, int compositesToGroup)
+    {
+        this(new ColumnSlice[] { new ColumnSlice(start, finish) }, reversed, count, compositesToGroup, 1);
     }
 
     /**
@@ -79,9 +81,24 @@ public class SliceQueryFilter implements IFilter
         this.countMutliplierForCompatibility = countMutliplierForCompatibility;
     }
 
+    public SliceQueryFilter cloneShallow()
+    {
+        return new SliceQueryFilter(slices, reversed, count, compositesToGroup, countMutliplierForCompatibility);
+    }
+
     public SliceQueryFilter withUpdatedCount(int newCount)
     {
         return new SliceQueryFilter(slices, reversed, newCount, compositesToGroup, countMutliplierForCompatibility);
+    }
+
+    public SliceQueryFilter withUpdatedSlices(ColumnSlice[] newSlices)
+    {
+        return new SliceQueryFilter(newSlices, reversed, count, compositesToGroup, countMutliplierForCompatibility);
+    }
+
+    public SliceQueryFilter withUpdatedSlice(ByteBuffer start, ByteBuffer finish)
+    {
+        return new SliceQueryFilter(new ColumnSlice[]{ new ColumnSlice(start, finish) }, reversed, count, compositesToGroup, countMutliplierForCompatibility);
     }
 
     public OnDiskAtomIterator getMemtableColumnIterator(ColumnFamily cf, DecoratedKey key)
@@ -99,72 +116,86 @@ public class SliceQueryFilter implements IFilter
         return new SSTableSliceIterator(sstable, file, key, slices, reversed, indexEntry);
     }
 
-    public SuperColumn filterSuperColumn(SuperColumn superColumn, int gcBefore)
-    {
-        // we clone shallow, then add, under the theory that generally we're interested in a relatively small number of subcolumns.
-        // this may be a poor assumption.
-        SuperColumn scFiltered = superColumn.cloneMeShallow();
-        Iterator<IColumn> subcolumns;
-        if (reversed)
-        {
-            List<IColumn> columnsAsList = new ArrayList<IColumn>(superColumn.getSubColumns());
-            subcolumns = Lists.reverse(columnsAsList).iterator();
-        }
-        else
-        {
-            subcolumns = superColumn.getSubColumns().iterator();
-        }
-
-        // iterate until we get to the "real" start column
-        Comparator<ByteBuffer> comparator = reversed ? superColumn.getComparator().reverseComparator : superColumn.getComparator();
-        while (subcolumns.hasNext())
-        {
-            IColumn column = subcolumns.next();
-            if (comparator.compare(column.name(), start()) >= 0)
-            {
-                subcolumns = Iterators.concat(Iterators.singletonIterator(column), subcolumns);
-                break;
-            }
-        }
-        // subcolumns is either empty now, or has been redefined in the loop above. either is ok.
-        collectReducedColumns(scFiltered, subcolumns, gcBefore);
-        return scFiltered;
-    }
-
-    public Comparator<IColumn> getColumnComparator(AbstractType<?> comparator)
+    public Comparator<Column> getColumnComparator(AbstractType<?> comparator)
     {
         return reversed ? comparator.columnReverseComparator : comparator.columnComparator;
     }
 
-    public void collectReducedColumns(IColumnContainer container, Iterator<IColumn> reducedColumns, int gcBefore)
+    public void collectReducedColumns(ColumnFamily container, Iterator<Column> reducedColumns, int gcBefore)
     {
-        AbstractType<?> comparator = container.getComparator();
-
-        if (compositesToGroup < 0)
-            columnCounter = new ColumnCounter();
-        else if (compositesToGroup == 0)
-            columnCounter = new ColumnCounter.GroupByPrefix(null, 0);
-        else
-            columnCounter = new ColumnCounter.GroupByPrefix((CompositeType)comparator, compositesToGroup);
+        columnCounter = getColumnCounter(container);
 
         while (reducedColumns.hasNext())
         {
-            IColumn column = reducedColumns.next();
+            Column column = reducedColumns.next();
             if (logger.isTraceEnabled())
                 logger.trace(String.format("collecting %s of %s: %s",
-                                           columnCounter.live(), count, column.getString(comparator)));
+                                           columnCounter.live(), count, column.getString(container.getComparator())));
 
             columnCounter.count(column, container);
 
             if (columnCounter.live() > count)
-            {
-                logger.debug("Read %s live columns and %s tombstoned", columnCounter.live(), columnCounter.ignored());
                 break;
-            }
 
             // but we need to add all non-gc-able columns to the result for read repair:
             if (QueryFilter.isRelevant(column, container, gcBefore))
                 container.addColumn(column);
+        }
+
+        Tracing.trace("Read {} live cells and {} tombstoned", columnCounter.live(), columnCounter.ignored());
+    }
+
+    public int getLiveCount(ColumnFamily cf)
+    {
+        ColumnCounter counter = getColumnCounter(cf);
+        for (Column column : cf)
+            counter.count(column, cf);
+        return counter.live();
+    }
+
+    private ColumnCounter getColumnCounter(ColumnFamily container)
+    {
+        AbstractType<?> comparator = container.getComparator();
+        if (compositesToGroup < 0)
+            return new ColumnCounter();
+        else if (compositesToGroup == 0)
+            return new ColumnCounter.GroupByPrefix(null, 0);
+        else
+            return new ColumnCounter.GroupByPrefix((CompositeType)comparator, compositesToGroup);
+    }
+
+    public void trim(ColumnFamily cf, int trimTo)
+    {
+        ColumnCounter counter = getColumnCounter(cf);
+
+        Collection<ByteBuffer> toRemove = null;
+        boolean trimRemaining = false;
+
+        Collection<Column> columns = reversed
+                                   ? cf.getReverseSortedColumns()
+                                   : cf.getSortedColumns();
+
+        for (Column column : columns)
+        {
+            if (trimRemaining)
+            {
+                toRemove.add(column.name());
+                continue;
+            }
+
+            counter.count(column, cf);
+            if (counter.live() > trimTo)
+            {
+                toRemove = new HashSet<ByteBuffer>();
+                toRemove.add(column.name());
+                trimRemaining = true;
+            }
+        }
+
+        if (toRemove != null)
+        {
+            for (ByteBuffer columnName : toRemove)
+                cf.remove(columnName);
         }
     }
 
@@ -192,7 +223,7 @@ public class SliceQueryFilter implements IFilter
     @Override
     public String toString()
     {
-        return "SliceQueryFilter [reversed=" + reversed + ", slices=" + Arrays.toString(slices) + ", count=" + count + "]";
+        return "SliceQueryFilter [reversed=" + reversed + ", slices=" + Arrays.toString(slices) + ", count=" + count + ", toGroup = " + compositesToGroup + "]";
     }
 
     public boolean isReversed()

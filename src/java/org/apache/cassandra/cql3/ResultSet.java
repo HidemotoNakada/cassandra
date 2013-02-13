@@ -26,14 +26,13 @@ import org.jboss.netty.buffer.ChannelBuffers;
 import org.apache.cassandra.transport.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.LongType;
-import org.apache.cassandra.db.marshal.TypeParser;
+import org.apache.cassandra.db.marshal.ReversedType;
 import org.apache.cassandra.thrift.Column;
 import org.apache.cassandra.thrift.CqlMetadata;
 import org.apache.cassandra.thrift.CqlResult;
 import org.apache.cassandra.thrift.CqlResultType;
 import org.apache.cassandra.thrift.CqlRow;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.FBUtilities;
 
 public class ResultSet
 {
@@ -57,6 +56,12 @@ public class ResultSet
     public int size()
     {
         return rows.size();
+    }
+
+    public void addRow(List<ByteBuffer> row)
+    {
+        assert row.size() == metadata.names.size();
+        rows.add(row);
     }
 
     public void addColumnValue(ByteBuffer value)
@@ -112,7 +117,9 @@ public class ResultSet
         {
             ByteBuffer colName = ByteBufferUtil.bytes(name.toString());
             schema.name_types.put(colName, UTF8);
-            schema.value_types.put(colName, name.type.toString());
+            AbstractType<?> normalizedType = name.type instanceof ReversedType ? ((ReversedType)name.type).baseType : name.type;
+            schema.value_types.put(colName, normalizedType.toString());
+
         }
 
         List<CqlRow> cqlRows = new ArrayList<CqlRow>(rows.size());

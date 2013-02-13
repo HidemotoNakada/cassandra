@@ -109,19 +109,7 @@ public class ParallelCompactionIterable extends AbstractCompactionIterable
                 throw new RuntimeException(e);
             }
 
-            if (compactedRow.isEmpty())
-            {
-                controller.invalidateCachedRow(compactedRow.key);
-                return null;
-            }
-            else
-            {
-                // If the raw is cached, we call removeDeleted on it to have/ coherent query returns. However it would look
-                // like some deleted columns lived longer than gc_grace + compaction. This can also free up big amount of
-                // memory on long running instances
-                controller.invalidateCachedRow(compactedRow.key);
-                return compactedRow;
-            }
+            return compactedRow;
         }
 
         public void close() throws IOException
@@ -135,7 +123,7 @@ public class ParallelCompactionIterable extends AbstractCompactionIterable
         private final List<RowContainer> rows = new ArrayList<RowContainer>();
         private int row = 0;
 
-        private final ThreadPoolExecutor executor = new DebuggableThreadPoolExecutor(Runtime.getRuntime().availableProcessors(),
+        private final ThreadPoolExecutor executor = new DebuggableThreadPoolExecutor(FBUtilities.getAvailableProcessors(),
                                                                                      Integer.MAX_VALUE,
                                                                                      TimeUnit.MILLISECONDS,
                                                                                      new SynchronousQueue<Runnable>(),
@@ -150,6 +138,7 @@ public class ParallelCompactionIterable extends AbstractCompactionIterable
         {
             assert rows.size() > 0;
 
+            ParallelCompactionIterable.this.updateCounterFor(rows.size());
             CompactedRowContainer compacted = getCompactedRow(rows);
             rows.clear();
             if ((row++ % 1000) == 0)
@@ -218,7 +207,7 @@ public class ParallelCompactionIterable extends AbstractCompactionIterable
                     {
                         // addAll is ok even if cf is an ArrayBackedSortedColumns
                         SecondaryIndexManager.Updater indexer = controller.cfs.indexManager.updaterFor(row.key, false);
-                        cf.addAllWithSizeDelta(thisCF, HeapAllocator.instance, Functions.<IColumn>identity(), indexer);
+                        cf.addAllWithSizeDelta(thisCF, HeapAllocator.instance, Functions.<Column>identity(), indexer);
                     }
                 }
 
@@ -229,7 +218,7 @@ public class ParallelCompactionIterable extends AbstractCompactionIterable
         private class DeserializedColumnIterator implements ICountableColumnIterator
         {
             private final Row row;
-            private Iterator<IColumn> iter;
+            private Iterator<Column> iter;
 
             public DeserializedColumnIterator(Row row)
             {

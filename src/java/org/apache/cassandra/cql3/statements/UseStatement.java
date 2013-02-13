@@ -21,9 +21,12 @@ import java.nio.ByteBuffer;
 import java.util.List;
 
 import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.UnauthorizedException;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
 
 public class UseStatement extends ParsedStatement implements CQLStatement
 {
@@ -39,18 +42,24 @@ public class UseStatement extends ParsedStatement implements CQLStatement
         return new Prepared(this);
     }
 
-    public void checkAccess(ClientState state)
+    public void checkAccess(ClientState state) throws UnauthorizedException
     {
-        // No specific access
+        state.validateLogin();
     }
 
     public void validate(ClientState state) throws InvalidRequestException
     {
     }
 
-    public ResultMessage execute(ClientState state, List<ByteBuffer> variables) throws InvalidRequestException
+    public ResultMessage execute(ConsistencyLevel cl, QueryState state, List<ByteBuffer> variables) throws InvalidRequestException
     {
-        state.setKeyspace(keyspace);
+        state.getClientState().setKeyspace(keyspace);
         return new ResultMessage.SetKeyspace(keyspace);
+    }
+
+    public ResultMessage executeInternal(QueryState state)
+    {
+        // Internal queries are exclusively on the system keyspace and 'use' is thus useless
+        throw new UnsupportedOperationException();
     }
 }

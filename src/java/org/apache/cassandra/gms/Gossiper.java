@@ -26,6 +26,7 @@ import java.util.concurrent.*;
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -90,7 +91,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
     private final Set<InetAddress> seeds = new ConcurrentSkipListSet<InetAddress>(inetcomparator);
 
     /* map where key is the endpoint and value is the state associated with the endpoint */
-    final Map<InetAddress, EndpointState> endpointStateMap = new ConcurrentHashMap<InetAddress, EndpointState>();
+    final ConcurrentMap<InetAddress, EndpointState> endpointStateMap = new ConcurrentHashMap<InetAddress, EndpointState>();
 
     /* map where key is endpoint and value is timestamp when this endpoint was removed from
      * gossip. We will ignore any gossip regarding these endpoints for QUARANTINE_DELAY time
@@ -233,6 +234,8 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         {
             markDead(endpoint, epState);
         }
+        else
+            epState.markDead();
     }
 
     /**
@@ -278,6 +281,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         FailureDetector.instance.remove(endpoint);
         MessagingService.instance().resetVersion(endpoint);
         quarantineEndpoint(endpoint);
+        MessagingService.instance().destroyConnectionPool(endpoint);
         if (logger.isDebugEnabled())
             logger.debug("removing endpoint " + endpoint);
     }
@@ -387,8 +391,10 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         EndpointState epState = endpointStateMap.get(endpoint);
         epState.updateTimestamp(); // make sure we don't evict it too soon
         epState.getHeartBeatState().forceNewerGenerationUnsafe();
-        epState.addApplicationState(ApplicationState.STATUS, StorageService.instance.valueFactory.removedNonlocal(hostId,computeExpireTime()));
+        long expireTime = computeExpireTime();
+        epState.addApplicationState(ApplicationState.STATUS, StorageService.instance.valueFactory.removedNonlocal(hostId, expireTime));
         logger.info("Completing removal of " + endpoint);
+        addExpireTimeForEndpoint(endpoint, expireTime);
         endpointStateMap.put(endpoint, epState);
         // ensure at least one gossip round occurs before returning
         try
@@ -600,12 +606,8 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
     protected long getExpireTimeForEndpoint(InetAddress endpoint)
     {
         /* default expireTime is aVeryLongTime */
-        long expireTime = computeExpireTime();
-        if (expireTimeEndpointMap.containsKey(endpoint))
-        {
-            expireTime = expireTimeEndpointMap.get(endpoint);
-        }
-        return expireTime;
+        Long storedTime = expireTimeEndpointMap.get(endpoint);
+        return storedTime == null ? computeExpireTime() : storedTime;
     }
 
     public EndpointState getEndpointStateForEndpoint(InetAddress ep)
@@ -625,6 +627,11 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         else  if (getEndpointStateForEndpoint(endpoint).getApplicationState(ApplicationState.NET_VERSION) != null && Integer.parseInt(getEndpointStateForEndpoint(endpoint).getApplicationState(ApplicationState.NET_VERSION).value) >= MessagingService.VERSION_12)
             return true;
         return false;
+    }
+
+    public boolean usesVnodes(InetAddress endpoint)
+    {
+        return usesHostId(endpoint) && getEndpointStateForEndpoint(endpoint).getApplicationState(ApplicationState.TOKENS) != null;
     }
 
     public UUID getHostId(InetAddress endpoint)
@@ -683,14 +690,6 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         EndpointState ep2 = getEndpointStateForEndpoint(addr2);
         assert ep1 != null && ep2 != null;
         return ep1.getHeartBeatState().getGeneration() - ep2.getHeartBeatState().getGeneration();
-    }
-
-    void notifyFailureDetector(List<GossipDigest> gDigests)
-    {
-        for ( GossipDigest gDigest : gDigests )
-        {
-            notifyFailureDetector(gDigest.endpoint, endpointStateMap.get(gDigest.endpoint));
-        }
     }
 
     void notifyFailureDetector(Map<InetAddress, EndpointState> remoteEpStateMap)
@@ -807,7 +806,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
             subscriber.onJoin(ep, epState);
     }
 
-    private Boolean isDeadState(EndpointState epState)
+    private boolean isDeadState(EndpointState epState)
     {
         if (epState.getApplicationState(ApplicationState.STATUS) == null)
             return false;
@@ -1000,11 +999,15 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         }
     }
 
+    public void start(int generationNumber)
+    {
+        start(generationNumber, new HashMap<ApplicationState, VersionedValue>());
+    }
+
     /**
-     * Start the gossiper with the generation # retrieved from the System
-     * table
+     * Start the gossiper with the generation number, preloading the map of application states before starting
      */
-    public void start(int generationNbr)
+    public void start(int generationNbr, Map<ApplicationState, VersionedValue> preloadLocalStates)
     {
         /* Get the seeds from the config and initialize them. */
         Set<InetAddress> seedHosts = DatabaseDescriptor.getSeeds();
@@ -1018,6 +1021,8 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         /* initialize the heartbeat state for this localEndpoint */
         maybeInitializeLocalState(generationNbr);
         EndpointState localState = endpointStateMap.get(FBUtilities.getBroadcastAddress());
+        for (Map.Entry<ApplicationState, VersionedValue> entry : preloadLocalStates.entrySet())
+            localState.addApplicationState(entry.getKey(), entry.getValue());
 
         //notify snitches that Gossiper is about to start
         DatabaseDescriptor.getEndpointSnitch().gossiperStarting();
@@ -1030,17 +1035,13 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
                                                               TimeUnit.MILLISECONDS);
     }
 
-    // initialize local HB state if needed.
+    // initialize local HB state if needed, i.e., if gossiper has never been started before.
     public void maybeInitializeLocalState(int generationNbr)
     {
-        EndpointState localState = endpointStateMap.get(FBUtilities.getBroadcastAddress());
-        if ( localState == null )
-        {
-            HeartBeatState hbState = new HeartBeatState(generationNbr);
-            localState = new EndpointState(hbState);
-            localState.markAlive();
-            endpointStateMap.put(FBUtilities.getBroadcastAddress(), localState);
-        }
+        HeartBeatState hbState = new HeartBeatState(generationNbr);
+        EndpointState localState = new EndpointState(hbState);
+        localState.markAlive();
+        endpointStateMap.putIfAbsent(FBUtilities.getBroadcastAddress(), localState);
     }
 
 
@@ -1092,27 +1093,21 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
         return (scheduledGossipTask != null) && (!scheduledGossipTask.isCancelled());
     }
 
-    /**
-     * This should *only* be used for testing purposes.
-     */
-    public void initializeNodeUnsafe(InetAddress addr, UUID uuid, int generationNbr) {
-        /* initialize the heartbeat state for this localEndpoint */
-        EndpointState localState = endpointStateMap.get(addr);
-        if ( localState == null )
-        {
-            HeartBeatState hbState = new HeartBeatState(generationNbr);
-            localState = new EndpointState(hbState);
-            localState.markAlive();
-            endpointStateMap.put(addr, localState);
-        }
+    @VisibleForTesting
+    public void initializeNodeUnsafe(InetAddress addr, UUID uuid, int generationNbr)
+    {
+        HeartBeatState hbState = new HeartBeatState(generationNbr);
+        EndpointState newState = new EndpointState(hbState);
+        newState.markAlive();
+        EndpointState oldState = endpointStateMap.putIfAbsent(addr, newState);
+        EndpointState localState = oldState == null ? newState : oldState;
+
         // always add the version state
         localState.addApplicationState(ApplicationState.NET_VERSION, StorageService.instance.valueFactory.networkVersion());
         localState.addApplicationState(ApplicationState.HOST_ID, StorageService.instance.valueFactory.hostId(uuid));
     }
 
-    /**
-     * This should *only* be used for testing purposes
-     */
+    @VisibleForTesting
     public void injectApplicationState(InetAddress endpoint, ApplicationState state, VersionedValue value)
     {
         EndpointState localState = endpointStateMap.get(endpoint);
